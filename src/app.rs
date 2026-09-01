@@ -43,6 +43,7 @@ pub struct App {
     pub storage_quota: Option<(u64, u64)>,
     pub show_preview: bool,
     pub preview_image: Option<ratatui_image::protocol::StatefulProtocol>,
+    pub preview_dims: Option<(u32, u32)>,
     pub picker: ratatui_image::picker::Picker,
 }
 
@@ -71,6 +72,7 @@ impl App {
             storage_quota: None,
             show_preview: false,
             preview_image: None,
+            preview_dims: None,
             picker: ratatui_image::picker::Picker::from_query_stdio()
                 .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
         }

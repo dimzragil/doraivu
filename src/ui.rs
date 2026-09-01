@@ -79,9 +79,26 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .highlight_symbol(">> ");
 
     if app.show_preview {
+        let available_height = chunks[1].height.saturating_sub(2); // borders
+        
+        let preview_width = if let Some((img_w, img_h)) = app.preview_dims {
+            // Terminal cells universally have a roughly 1:2 aspect ratio (width:height).
+            // The exact pixel size doesn't matter, only the ratio for calculating column width.
+            let font_ratio = 2.0_f64; // height / width
+            
+            if img_h > 0 {
+                let cols = (img_w as f64 * available_height as f64 * font_ratio) / (img_h as f64);
+                (cols.ceil() as u16).saturating_add(2) // +2 for borders
+            } else {
+                40
+            }
+        } else {
+            40
+        };
+
         let center_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([Constraint::Min(20), Constraint::Length(preview_width)])
             .split(chunks[1]);
             
         f.render_stateful_widget(list, center_chunks[0], &mut app.state);

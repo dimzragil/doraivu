@@ -326,6 +326,7 @@ async fn main() -> Result<()> {
                     Action::ImagePreview(bytes) => {
                         if app.show_preview {
                             if let Ok(img) = image::load_from_memory(&bytes) {
+                                app.preview_dims = Some((img.width(), img.height()));
                                 app.preview_image = Some(app.picker.new_resize_protocol(img));
                             }
                         }
@@ -416,6 +417,7 @@ fn trigger_preview(app: &mut App, client: &Client, token: &str, tx: &mpsc::Sende
         return;
     }
     app.preview_image = None; // clear old preview
+    app.preview_dims = None;
     if let Some(file) = app.selected_file() {
         if file.mime_type.starts_with("image/") {
             let c = client.clone();
