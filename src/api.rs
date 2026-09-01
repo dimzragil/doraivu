@@ -230,29 +230,98 @@ pub async fn fetch_preview(
 }
 
 /// Uploads a file using multipart
-pub async fn upload_file(
+
+async fn resolve_or_create_path(
+    client: &Client,
+    access_token: &str,
+    path: &str,
+    tx: &mpsc::Sender<Event>,
+) -> anyhow::Result<String> {
+    if !path.starts_with('/') {
+        return Ok(path.to_string());
+    }
+
+    let mut current_id = "root".to_string();
+    let parts: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for part in parts {
+        let _ = tx
+            .send(Event::Action(Action::UploadComplete(format!(
+                "Resolving {}...",
+                part
+            ))))
+            .await;
+
+        let query = format!("mimeType = 'application/vnd.google-apps.folder' and name = '{}' and '{}' in parents and trashed = false", part, current_id);
+        let url = format!(
+            "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id)",
+            urlencoding::encode(&query)
+        );
+
+        let res = client.get(&url).bearer_auth(access_token).send().await?;
+        if !res.status().is_success() {
+            anyhow::bail!("API err {}", part);
+        }
+
+        let data: serde_json::Value = res.json().await?;
+        if let Some(files) = data["files"].as_array() {
+            if let Some(first) = files.first() {
+                if let Some(id) = first["id"].as_str() {
+                    current_id = id.to_string();
+                    continue;
+                }
+            }
+        }
+
+        let _ = tx
+            .send(Event::Action(Action::UploadComplete(format!(
+                "Creating {}...",
+                part
+            ))))
+            .await;
+
+        let metadata = serde_json::json!({
+            "name": part,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [current_id]
+        });
+
+        let res = client
+            .post("https://www.googleapis.com/drive/v3/files")
+            .bearer_auth(access_token)
+            .json(&metadata)
+            .send()
+            .await?;
+
+        if !res.status().is_success() {
+            anyhow::bail!("Fail create {}", part);
+        }
+
+        let data: serde_json::Value = res.json().await?;
+        if let Some(id) = data["id"].as_str() {
+            current_id = id.to_string();
+        } else {
+            anyhow::bail!("No ID {}", part);
+        }
+    }
+
+    Ok(current_id)
+}
+
+pub async fn upload_single_file_logic(
     client: Client,
     access_token: String,
     parent_id: String,
     local_path: String,
+    file_name: String,
     tx: mpsc::Sender<Event>,
-) {
-    let file = match tokio::fs::File::open(&local_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = tx
-                .send(Event::Action(Action::Error(format!("Open err: {}", e))))
-                .await;
-            return;
-        }
-    };
-
+) -> anyhow::Result<()> {
+    let file = tokio::fs::File::open(&local_path).await?;
     let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-    let file_name = std::path::Path::new(&local_path)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
 
     let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
     let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
@@ -320,36 +389,176 @@ pub async fn upload_file(
         .part("file", part_file);
 
     let url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-    match client
+    let res = client
         .post(url)
-        .bearer_auth(access_token)
+        .bearer_auth(&access_token)
         .multipart(form)
         .send()
-        .await
-    {
-        Ok(res) if res.status().is_success() => {
-            let _ = tx
-                .send(Event::Action(Action::UploadComplete(
-                    "Upload successful".into(),
-                )))
-                .await;
-        }
-        Ok(res) => {
-            let err = res.text().await.unwrap_or_default();
-            let _ = tx
-                .send(Event::Action(Action::Error(format!(
-                    "Upload failed: {}",
-                    err
-                ))))
-                .await;
-        }
+        .await?;
+
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("Upload failed: {}", res.text().await.unwrap_or_default())
+    }
+}
+
+pub async fn upload_file(
+    client: Client,
+    access_token: String,
+    parent_path_or_id: String,
+    local_path: String,
+    tx: mpsc::Sender<Event>,
+) {
+    let parent_id =
+        match resolve_or_create_path(&client, &access_token, &parent_path_or_id, &tx).await {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = tx
+                    .send(Event::Action(Action::Error(format!("Path err: {}", e))))
+                    .await;
+                return;
+            }
+        };
+
+    let metadata = match tokio::fs::metadata(&local_path).await {
+        Ok(m) => m,
         Err(e) => {
             let _ = tx
-                .send(Event::Action(Action::Error(format!(
-                    "Upload req err: {}",
-                    e
-                ))))
+                .send(Event::Action(Action::Error(format!("Metadata err: {}", e))))
                 .await;
+            return;
+        }
+    };
+
+    if metadata.is_dir() {
+        let mut queue = vec![(std::path::PathBuf::from(&local_path), parent_id)];
+        let mut count = 0;
+
+        while let Some((current_dir, current_parent_id)) = queue.pop() {
+            let mut entries = match tokio::fs::read_dir(&current_dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let entry_meta = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                if entry_meta.is_dir() {
+                    let _ = tx
+                        .send(Event::Action(Action::UploadComplete(format!(
+                            "Creating folder {}...",
+                            name
+                        ))))
+                        .await;
+
+                    let query = format!("mimeType = 'application/vnd.google-apps.folder' and name = '{}' and '{}' in parents and trashed = false", name, current_parent_id);
+                    let url = format!(
+                        "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id)",
+                        urlencoding::encode(&query)
+                    );
+
+                    let res = client.get(&url).bearer_auth(&access_token).send().await;
+                    let mut new_id = None;
+                    if let Ok(r) = res {
+                        if r.status().is_success() {
+                            if let Ok(data) = r.json::<serde_json::Value>().await {
+                                if let Some(files) = data["files"].as_array() {
+                                    if let Some(first) = files.first() {
+                                        if let Some(id) = first["id"].as_str() {
+                                            new_id = Some(id.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let next_parent_id = if let Some(id) = new_id {
+                        id
+                    } else {
+                        let meta = serde_json::json!({
+                            "name": name,
+                            "mimeType": "application/vnd.google-apps.folder",
+                            "parents": [current_parent_id]
+                        });
+                        let res = client
+                            .post("https://www.googleapis.com/drive/v3/files")
+                            .bearer_auth(&access_token)
+                            .json(&meta)
+                            .send()
+                            .await;
+
+                        match res {
+                            Ok(r) if r.status().is_success() => {
+                                if let Ok(data) = r.json::<serde_json::Value>().await {
+                                    data["id"].as_str().unwrap_or_default().to_string()
+                                } else {
+                                    continue;
+                                }
+                            }
+                            _ => continue,
+                        }
+                    };
+                    queue.push((path, next_parent_id));
+                } else {
+                    count += 1;
+                    let _ = tx
+                        .send(Event::Action(Action::UploadComplete(format!(
+                            "Uploading {} (file {})",
+                            name, count
+                        ))))
+                        .await;
+                    let _ = upload_single_file_logic(
+                        client.clone(),
+                        access_token.clone(),
+                        current_parent_id.clone(),
+                        path.to_string_lossy().to_string(),
+                        name,
+                        tx.clone(),
+                    )
+                    .await;
+                }
+            }
+        }
+        let _ = tx
+            .send(Event::Action(Action::UploadComplete(
+                "Directory upload complete".into(),
+            )))
+            .await;
+    } else {
+        let file_name = std::path::Path::new(&local_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        match upload_single_file_logic(
+            client.clone(),
+            access_token.clone(),
+            parent_id,
+            local_path,
+            file_name,
+            tx.clone(),
+        )
+        .await
+        {
+            Ok(_) => {
+                let _ = tx
+                    .send(Event::Action(Action::UploadComplete(
+                        "Upload successful".into(),
+                    )))
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(Event::Action(Action::Error(format!("Upload fail: {}", e))))
+                    .await;
+            }
         }
     }
 }

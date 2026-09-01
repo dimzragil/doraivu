@@ -102,7 +102,63 @@ pub fn render(f: &mut Frame, app: &mut App) {
         )
         .highlight_symbol(">> ");
 
-    if app.show_preview {
+    if app.input_mode == crate::app::InputMode::TrashView
+        || app.input_mode == crate::app::InputMode::TrashDeleteConfirmModal
+        || app.input_mode == crate::app::InputMode::TrashDeleteAllConfirmModal
+    {
+        crate::trash::render_trash_block(f, chunks[1], app);
+
+        if app.input_mode == crate::app::InputMode::TrashDeleteConfirmModal {
+            let area = centered_rect(40, 6, f.area());
+            use ratatui::widgets::Clear;
+            f.render_widget(Clear, area);
+
+            use ratatui::layout::Alignment;
+
+            let block = Block::default()
+                .title(" Delete File Permanently ")
+                .title_bottom(Line::from(" [y] Yes ").alignment(Alignment::Right))
+                .title_bottom(Line::from(" [n] No ").alignment(Alignment::Left))
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::Red));
+
+            let name = app
+                .trash_state
+                .selected()
+                .and_then(|i| app.trashed_files.get(i))
+                .map(|file| file.name.clone())
+                .unwrap_or_default();
+            let p = Paragraph::new(format!(
+                "\nAre you sure you want to permanently delete\n{}?",
+                name
+            ))
+            .alignment(Alignment::Center)
+            .block(block);
+
+            f.render_widget(p, area);
+        } else if app.input_mode == crate::app::InputMode::TrashDeleteAllConfirmModal {
+            let area = centered_rect(40, 6, f.area());
+            use ratatui::widgets::Clear;
+            f.render_widget(Clear, area);
+
+            use ratatui::layout::Alignment;
+
+            let block = Block::default()
+                .title(" Empty Trash ")
+                .title_bottom(Line::from(" [y] Yes ").alignment(Alignment::Right))
+                .title_bottom(Line::from(" [n] No ").alignment(Alignment::Left))
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::Red));
+
+            let p = Paragraph::new(
+                "\nAre you sure you want to EMPTY TRASH?\nThis action cannot be undone.",
+            )
+            .alignment(Alignment::Center)
+            .block(block);
+
+            f.render_widget(p, area);
+        }
+    } else if app.show_preview {
         let available_height = chunks[1].height.saturating_sub(2); // borders
 
         let preview_width = if let Some((img_w, img_h)) = app.preview_dims {
@@ -114,10 +170,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let cols = (img_w as f64 * available_height as f64 * font_ratio) / (img_h as f64);
                 (cols.ceil() as u16).saturating_add(2) // +2 for borders
             } else {
-                40
+                (chunks[1].width / 2).max(20)
             }
         } else {
-            40
+            (chunks[1].width / 2).max(20)
         };
 
         let center_chunks = Layout::default()
@@ -243,6 +299,29 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .map(|f| f.name.clone())
             .unwrap_or_default();
         let p = Paragraph::new(format!("\nAre you sure you want to delete\n{}?", name))
+            .alignment(Alignment::Center)
+            .block(block);
+
+        f.render_widget(p, area);
+    } else if app.input_mode == crate::app::InputMode::DownloadConfirmModal {
+        let area = centered_rect(40, 6, f.area());
+        use ratatui::widgets::Clear;
+        f.render_widget(Clear, area);
+
+        use ratatui::layout::Alignment;
+
+        let block = Block::default()
+            .title(" Download File ")
+            .title_bottom(Line::from(" [y] Yes ").alignment(Alignment::Right))
+            .title_bottom(Line::from(" [n] No ").alignment(Alignment::Left))
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Green));
+
+        let name = app
+            .selected_file()
+            .map(|f| f.name.clone())
+            .unwrap_or_default();
+        let p = Paragraph::new(format!("\nAre you sure you want to download\n{}?", name))
             .alignment(Alignment::Center)
             .block(block);
 

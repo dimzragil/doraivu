@@ -13,6 +13,7 @@ pub struct DriveFile {
 /// Represents background network actions that update the UI
 pub enum Action {
     LoadFiles(Vec<DriveFile>),
+    LoadTrash(Vec<DriveFile>),
     Error(String),
     DownloadProgress(u64, u64, f64), // (downloaded, total, speed)
     DownloadComplete(String),
@@ -28,6 +29,10 @@ pub enum InputMode {
     Normal,
     UploadModal,
     DeleteConfirmModal,
+    DownloadConfirmModal,
+    TrashView,
+    TrashDeleteConfirmModal,
+    TrashDeleteAllConfirmModal,
 }
 
 /// Main event enum for the TUI event loop
@@ -40,7 +45,9 @@ pub enum Event {
 /// Core application state
 pub struct App {
     pub files: Vec<DriveFile>,
+    pub trashed_files: Vec<DriveFile>,
     pub state: ListState,
+    pub trash_state: ListState,
     pub current_path: String,
     pub status: String,
     pub should_quit: bool,
@@ -74,7 +81,9 @@ impl App {
         state.select(Some(0));
         Self {
             files: Vec::new(),
+            trashed_files: Vec::new(),
             state,
+            trash_state: ListState::default(),
             current_path: "root".to_string(),
             status: "Loading...".to_string(),
             should_quit: false,

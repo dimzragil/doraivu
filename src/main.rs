@@ -1,10 +1,11 @@
 mod api;
 mod app;
 mod auth;
+mod trash;
 mod ui;
 
 use anyhow::Result;
-use api::{download_file, fetch_files, fetch_preview, fetch_quota, upload_file};
+use api::{fetch_files, fetch_preview, fetch_quota, upload_file};
 use app::{Action, App, Event};
 use auth::{authenticate, AuthInfo};
 use crossterm::{
@@ -137,6 +138,94 @@ async fn main() -> Result<()> {
         if let Some(event) = rx.recv().await {
             match event {
                 Event::Input(key) => match app.input_mode {
+                    app::InputMode::TrashView => match key.code {
+                        KeyCode::Esc => {
+                            app.input_mode = app::InputMode::Normal;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !app.trashed_files.is_empty() {
+                                let i = match app.trash_state.selected() {
+                                    Some(i) => {
+                                        if i >= app.trashed_files.len() - 1 {
+                                            app.trashed_files.len() - 1
+                                        } else {
+                                            i + 1
+                                        }
+                                    }
+                                    None => 0,
+                                };
+                                app.trash_state.select(Some(i));
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            if !app.trashed_files.is_empty() {
+                                let i = match app.trash_state.selected() {
+                                    Some(i) => i.saturating_sub(1),
+                                    None => 0,
+                                };
+                                app.trash_state.select(Some(i));
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            if let Some(i) = app.trash_state.selected() {
+                                if let Some(file) = app.trashed_files.get(i).cloned() {
+                                    app.status = format!("Restoring {}...", file.name);
+                                    let c = client.clone();
+                                    let t = token.access_token.clone();
+                                    let txc = tx.clone();
+                                    tokio::spawn(async move {
+                                        trash::restore_file(c, t, file.id, txc).await;
+                                    });
+                                }
+                            }
+                        }
+                        KeyCode::Char('x') | KeyCode::Delete => {
+                            if app.trash_state.selected().is_some() {
+                                app.input_mode = app::InputMode::TrashDeleteConfirmModal;
+                            }
+                        }
+                        KeyCode::Char('X') if !app.trashed_files.is_empty() => {
+                            app.input_mode = app::InputMode::TrashDeleteAllConfirmModal;
+                        }
+                        _ => {}
+                    },
+                    app::InputMode::TrashDeleteConfirmModal => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            if let Some(i) = app.trash_state.selected() {
+                                if let Some(file) = app.trashed_files.get(i).cloned() {
+                                    app.status = format!("Deleting permanently {}...", file.name);
+                                    let c = client.clone();
+                                    let t = token.access_token.clone();
+                                    let txc = tx.clone();
+                                    tokio::spawn(async move {
+                                        trash::delete_permanently(c, t, file.id, txc).await;
+                                    });
+                                }
+                            }
+                            app.input_mode = app::InputMode::TrashView;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.input_mode = app::InputMode::TrashView;
+                        }
+                        _ => {}
+                    },
+                    app::InputMode::TrashDeleteAllConfirmModal => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            app.status = "Emptying trash...".into();
+                            let c = client.clone();
+                            let t = token.access_token.clone();
+                            let txc = tx.clone();
+                            let files = app.trashed_files.clone();
+                            tokio::spawn(async move {
+                                trash::empty_trash(c, t, files, txc).await;
+                            });
+                            app.input_mode = app::InputMode::TrashView;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.input_mode = app::InputMode::TrashView;
+                        }
+                        _ => {}
+                    },
                     app::InputMode::DeleteConfirmModal => match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                             if let Some(file) = app.selected_file().cloned() {
@@ -158,6 +247,25 @@ async fn main() -> Result<()> {
                         }
                         _ => {}
                     },
+                    app::InputMode::DownloadConfirmModal => match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                            if let Some(file) = app.selected_file().cloned() {
+                                app.download_progress = Some((0, 0, 0.0));
+                                let c = client.clone();
+                                let t = token.access_token.clone();
+                                let txc = tx.clone();
+                                tokio::spawn(async move {
+                                    api::download_file(c, t, file, txc).await;
+                                });
+                            }
+                            app.input_mode = app::InputMode::Normal;
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                            app.input_mode = app::InputMode::Normal;
+                        }
+                        _ => {}
+                    },
+
                     app::InputMode::UploadModal => match key.code {
                         KeyCode::Esc => {
                             app.input_mode = app::InputMode::Normal;
@@ -272,6 +380,16 @@ async fn main() -> Result<()> {
                                         fetch_quota(c, t, txc).await;
                                     });
                                 }
+                                KeyCode::Char('T') => {
+                                    app.input_mode = app::InputMode::TrashView;
+                                    app.status = "Loading trash...".into();
+                                    let c = client.clone();
+                                    let t = token.access_token.clone();
+                                    let txc = tx.clone();
+                                    tokio::spawn(async move {
+                                        crate::trash::fetch_trash(c, t, txc).await;
+                                    });
+                                }
                                 KeyCode::Char('/') => {
                                     app.search_mode = true;
                                     app.search_query.clear();
@@ -354,13 +472,7 @@ async fn main() -> Result<()> {
                                 KeyCode::Char('d') => {
                                     if let Some(file) = app.selected_file().cloned() {
                                         if file.mime_type != "application/vnd.google-apps.folder" {
-                                            app.download_progress = Some((0, 0, 0.0));
-                                            let c = client.clone();
-                                            let t = token.access_token.clone();
-                                            let txc = tx.clone();
-                                            tokio::spawn(async move {
-                                                download_file(c, t, file, txc).await;
-                                            });
+                                            app.input_mode = app::InputMode::DownloadConfirmModal;
                                         } else {
                                             app.status =
                                                 "Cannot download folders directly yet.".into();
@@ -376,7 +488,14 @@ async fn main() -> Result<()> {
                                             format!("/{}", app.path_names[1..].join("/"));
                                     }
                                     app.upload_input_idx = 1; // focus local path
-                                    app.upload_local_path.clear();
+                                    let home = directories::UserDirs::new()
+                                        .map(|u| u.home_dir().to_string_lossy().to_string())
+                                        .unwrap_or_else(|| "/".to_string());
+                                    app.upload_local_path = if home.ends_with('/') {
+                                        home
+                                    } else {
+                                        format!("{}/", home)
+                                    };
                                 }
                                 KeyCode::Char('e') => {
                                     if let Some(file) = app.selected_file().cloned() {
@@ -399,6 +518,18 @@ async fn main() -> Result<()> {
                         app.state
                             .select(if app.files.is_empty() { None } else { Some(0) });
                     }
+                    Action::LoadTrash(files) => {
+                        app.trashed_files = files;
+                        app.status = format!("Loaded {} trashed items.", app.trashed_files.len());
+                        app.trash_state.select(if app.trashed_files.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                    }
+                    Action::Message(msg) => {
+                        app.status = msg;
+                    }
                     Action::Error(err) => {
                         app.status = format!("Error: {}", err);
                         app.download_progress = None;
@@ -411,9 +542,7 @@ async fn main() -> Result<()> {
                         app.download_progress = None;
                         app.status = msg;
                     }
-                    Action::Message(msg) => {
-                        app.status = msg;
-                    }
+
                     Action::LoadQuota(used, limit) => {
                         app.storage_quota = Some((used, limit));
                     }
