@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Gauge},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame,
 };
 
@@ -25,6 +25,30 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{}B", bytes)
     }
+}
+
+fn centered_rect(
+    percent_x: u16,
+    fixed_height: u16,
+    r: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(r.height.saturating_sub(fixed_height) / 2),
+            Constraint::Length(fixed_height),
+            Constraint::Min(0),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
 
 /// Renders the entire TUI application state into the given terminal frame
@@ -80,12 +104,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     if app.show_preview {
         let available_height = chunks[1].height.saturating_sub(2); // borders
-        
+
         let preview_width = if let Some((img_w, img_h)) = app.preview_dims {
             // Terminal cells universally have a roughly 1:2 aspect ratio (width:height).
             // The exact pixel size doesn't matter, only the ratio for calculating column width.
             let font_ratio = 2.0_f64; // height / width
-            
+
             if img_h > 0 {
                 let cols = (img_w as f64 * available_height as f64 * font_ratio) / (img_h as f64);
                 (cols.ceil() as u16).saturating_add(2) // +2 for borders
@@ -100,13 +124,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(20), Constraint::Length(preview_width)])
             .split(chunks[1]);
-            
+
         f.render_stateful_widget(list, center_chunks[0], &mut app.state);
-        
+
         let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
         let inner_area = preview_block.inner(center_chunks[1]);
         f.render_widget(preview_block, center_chunks[1]);
-        
+
         if let Some(ref mut protocol) = app.preview_image {
             use ratatui_image::StatefulImage;
             f.render_stateful_widget(StatefulImage::new(), inner_area, protocol);
@@ -149,6 +173,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .percent(percent)
             .label(label);
         f.render_widget(gauge, bottom_chunks[0]);
+    } else if let Some((up, total, speed)) = app.upload_progress {
+        let percent = if total > 0 {
+            ((up as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as u16
+        } else {
+            0
+        };
+        let label = format!(
+            "{} / {} - {}/s",
+            format_bytes(up),
+            format_bytes(total),
+            format_bytes(speed as u64)
+        );
+        let gauge = Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title(" Uploading "))
+            .gauge_style(Style::default().fg(Color::Blue).bg(Color::DarkGray))
+            .percent(percent)
+            .label(label);
+        f.render_widget(gauge, bottom_chunks[0]);
     } else if app.search_mode {
         let search_block = Paragraph::new(format!("/{}", app.search_query))
             .block(Block::default().borders(Borders::ALL).title(" Search "))
@@ -167,9 +209,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
         } else {
             0
         };
-        
+
         let label = format!("{} / {}", format_bytes(used), format_bytes(limit));
-        
+
         let gauge = Gauge::default()
             .block(Block::default().borders(Borders::ALL).title(" Storage "))
             .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
@@ -180,5 +222,79 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let empty_block = Paragraph::new("Loading...")
             .block(Block::default().borders(Borders::ALL).title(" Storage "));
         f.render_widget(empty_block, bottom_chunks[1]);
+    }
+
+    if app.input_mode == crate::app::InputMode::DeleteConfirmModal {
+        let area = centered_rect(40, 6, f.area());
+        use ratatui::widgets::Clear;
+        f.render_widget(Clear, area);
+
+        use ratatui::layout::Alignment;
+
+        let block = Block::default()
+            .title(" Delete File ")
+            .title_bottom(Line::from(" [y] Yes ").alignment(Alignment::Right))
+            .title_bottom(Line::from(" [n] No ").alignment(Alignment::Left))
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Red));
+
+        let name = app
+            .selected_file()
+            .map(|f| f.name.clone())
+            .unwrap_or_default();
+        let p = Paragraph::new(format!("\nAre you sure you want to delete\n{}?", name))
+            .alignment(Alignment::Center)
+            .block(block);
+
+        f.render_widget(p, area);
+    } else if app.input_mode == crate::app::InputMode::UploadModal {
+        let area = centered_rect(60, 12, f.area()); // 12 lines fixed height
+        use ratatui::widgets::Clear;
+        f.render_widget(Clear, area);
+
+        use ratatui::layout::Alignment;
+
+        let block = Block::default()
+            .title(" Upload File ")
+            .title_bottom(Line::from(" [Tab] Switch ").alignment(Alignment::Left))
+            .title_bottom(Line::from(" [Enter] Upload ").alignment(Alignment::Right))
+            .borders(Borders::ALL);
+        f.render_widget(block, area);
+
+        let modal_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(2)
+            .constraints([Constraint::Length(3), Constraint::Length(3)])
+            .split(area);
+
+        let target_style = if app.upload_input_idx == 0 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        let local_style = if app.upload_input_idx == 1 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+
+        let p1 = Paragraph::new(app.upload_target_id.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Target Path "),
+            )
+            .style(target_style);
+
+        let p2 = Paragraph::new(app.upload_local_path.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Local File Path "),
+            )
+            .style(local_style);
+
+        f.render_widget(p1, modal_chunks[0]);
+        f.render_widget(p2, modal_chunks[1]);
     }
 }

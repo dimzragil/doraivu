@@ -17,8 +17,17 @@ pub enum Action {
     DownloadProgress(u64, u64, f64), // (downloaded, total, speed)
     DownloadComplete(String),
     Message(String),
-    LoadQuota(u64, u64), // (used, limit)
+    LoadQuota(u64, u64),           // (used, limit)
+    UploadProgress(u64, u64, f64), // (uploaded, total, speed)
+    UploadComplete(String),
     ImagePreview(Vec<u8>), // Fetched image bytes
+}
+
+#[derive(PartialEq)]
+pub enum InputMode {
+    Normal,
+    UploadModal,
+    DeleteConfirmModal,
 }
 
 /// Main event enum for the TUI event loop
@@ -45,6 +54,11 @@ pub struct App {
     pub preview_image: Option<ratatui_image::protocol::StatefulProtocol>,
     pub preview_dims: Option<(u32, u32)>,
     pub picker: ratatui_image::picker::Picker,
+    pub input_mode: InputMode,
+    pub upload_target_id: String,
+    pub upload_local_path: String,
+    pub upload_input_idx: usize, // 0 = target, 1 = file path
+    pub upload_progress: Option<(u64, u64, f64)>,
 }
 
 impl Default for App {
@@ -75,6 +89,11 @@ impl App {
             preview_dims: None,
             picker: ratatui_image::picker::Picker::from_query_stdio()
                 .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
+            input_mode: InputMode::Normal,
+            upload_target_id: String::new(),
+            upload_local_path: String::new(),
+            upload_input_idx: 1, // Default focus on file path
+            upload_progress: None,
         }
     }
 
