@@ -493,18 +493,44 @@ pub fn handle_input(
                     }
                     KeyCode::Backspace => {
                         app.search_query.pop();
-                        let c = client.clone();
-                        let t = token.access_token.clone();
                         let sq = app.search_query.clone().replace("'", "\\'");
-                        let txc = tx.clone();
-                        tokio::spawn(async move {
-                            let q = if sq.is_empty() {
-                                "'root' in parents and trashed = false".to_string()
+                        if sq.is_empty() {
+                            if app.current_path == "virtual_root" {
+                                app.files = vec![
+                                    crate::app::DriveFile {
+                                        id: "root".to_string(),
+                                        name: "My Drive".to_string(),
+                                        mime_type: "application/vnd.google-apps.folder".to_string(),
+                                    },
+                                    crate::app::DriveFile {
+                                        id: "shared_with_me".to_string(),
+                                        name: "Shared with me".to_string(),
+                                        mime_type: "application/vnd.google-apps.folder".to_string(),
+                                    },
+                                ];
                             } else {
-                                format!("name contains '{}' and trashed = false", sq)
-                            };
-                            fetch_files(c, t, q, txc).await;
-                        });
+                                let c = client.clone();
+                                let t = token.access_token.clone();
+                                let txc = tx.clone();
+                                let current = app.current_path.clone();
+                                tokio::spawn(async move {
+                                    let q = if current == "shared_with_me" {
+                                        "sharedWithMe = true and trashed = false".to_string()
+                                    } else {
+                                        format!("'{}' in parents and trashed = false", current)
+                                    };
+                                    fetch_files(c, t, q, txc).await;
+                                });
+                            }
+                        } else {
+                            let c = client.clone();
+                            let t = token.access_token.clone();
+                            let txc = tx.clone();
+                            tokio::spawn(async move {
+                                let q = format!("name contains '{}' and trashed = false", sq);
+                                fetch_files(c, t, q, txc).await;
+                            });
+                        }
                     }
                     KeyCode::Char(c) => {
                         app.search_query.push(c);
@@ -527,15 +553,41 @@ pub fn handle_input(
                     }
                     KeyCode::Char('j') | KeyCode::Down => {
                         app.next();
-                        trigger_preview(app, &client, &token.access_token, &tx);
+                        trigger_preview(app, client, &token.access_token, tx);
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         app.previous();
-                        trigger_preview(app, &client, &token.access_token, &tx);
+                        trigger_preview(app, client, &token.access_token, tx);
                     }
                     KeyCode::Char('p') => {
-                        app.show_preview = !app.show_preview;
-                        trigger_preview(app, &client, &token.access_token, &tx);
+                        if let Some(file) = app.selected_file() {
+                            if file.mime_type.starts_with("image/") {
+                                app.preview_mode = match app.preview_mode {
+                                    crate::app::PreviewMode::Hidden => {
+                                        crate::app::PreviewMode::Default
+                                    }
+                                    crate::app::PreviewMode::Default => {
+                                        crate::app::PreviewMode::ForceMetadata
+                                    }
+                                    crate::app::PreviewMode::ForceMetadata => {
+                                        crate::app::PreviewMode::Hidden
+                                    }
+                                };
+                            } else {
+                                app.preview_mode = match app.preview_mode {
+                                    crate::app::PreviewMode::Hidden => {
+                                        crate::app::PreviewMode::Default
+                                    }
+                                    _ => crate::app::PreviewMode::Hidden,
+                                };
+                            }
+                        } else {
+                            app.preview_mode = match app.preview_mode {
+                                crate::app::PreviewMode::Hidden => crate::app::PreviewMode::Default,
+                                _ => crate::app::PreviewMode::Hidden,
+                            };
+                        }
+                        trigger_preview(app, client, &token.access_token, tx);
                     }
                     KeyCode::Char('r') => {
                         app.status = "Refreshing...".into();
@@ -545,11 +597,31 @@ pub fn handle_input(
                         let t = token.access_token.clone();
                         let txc = tx.clone();
                         let parent_id = app.current_path.clone();
-                        tokio::spawn(async move {
-                            let q = format!("'{}' in parents and trashed = false", parent_id);
-                            fetch_files(c.clone(), t.clone(), q, txc.clone()).await;
-                            fetch_quota(c, t, txc).await;
-                        });
+                        if parent_id == "virtual_root" {
+                            app.files = vec![
+                                crate::app::DriveFile {
+                                    id: "root".to_string(),
+                                    name: "My Drive".to_string(),
+                                    mime_type: "application/vnd.google-apps.folder".to_string(),
+                                },
+                                crate::app::DriveFile {
+                                    id: "shared_with_me".to_string(),
+                                    name: "Shared with me".to_string(),
+                                    mime_type: "application/vnd.google-apps.folder".to_string(),
+                                },
+                            ];
+                            app.status = "Virtual Root loaded.".to_string();
+                        } else {
+                            tokio::spawn(async move {
+                                let q = if parent_id == "shared_with_me" {
+                                    "sharedWithMe = true and trashed = false".to_string()
+                                } else {
+                                    format!("'{}' in parents and trashed = false", parent_id)
+                                };
+                                fetch_files(c.clone(), t.clone(), q, txc.clone()).await;
+                                fetch_quota(c, t, txc).await;
+                            });
+                        }
                     }
                     KeyCode::Char('T') => {
                         app.input_mode = app::InputMode::TrashView;
@@ -603,7 +675,11 @@ pub fn handle_input(
                                 let txc = tx.clone();
 
                                 tokio::spawn(async move {
-                                    let q = format!("'{}' in parents and trashed = false", fid);
+                                    let q = if fid == "shared_with_me" {
+                                        "sharedWithMe = true and trashed = false".to_string()
+                                    } else {
+                                        format!("'{}' in parents and trashed = false", fid)
+                                    };
                                     fetch_files(c, t, q, txc).await;
                                 });
                             } else {
@@ -619,14 +695,33 @@ pub fn handle_input(
                             app.files.clear();
                             app.selected_files.clear();
 
-                            let c = client.clone();
-                            let t = token.access_token.clone();
-                            let txc = tx.clone();
-
-                            tokio::spawn(async move {
-                                let q = format!("'{}' in parents and trashed = false", parent_id);
-                                fetch_files(c, t, q, txc).await;
-                            });
+                            if parent_id == "virtual_root" {
+                                app.files = vec![
+                                    crate::app::DriveFile {
+                                        id: "root".to_string(),
+                                        name: "My Drive".to_string(),
+                                        mime_type: "application/vnd.google-apps.folder".to_string(),
+                                    },
+                                    crate::app::DriveFile {
+                                        id: "shared_with_me".to_string(),
+                                        name: "Shared with me".to_string(),
+                                        mime_type: "application/vnd.google-apps.folder".to_string(),
+                                    },
+                                ];
+                                app.status = "Virtual Root loaded.".to_string();
+                            } else {
+                                let c = client.clone();
+                                let t = token.access_token.clone();
+                                let txc = tx.clone();
+                                tokio::spawn(async move {
+                                    let q = if parent_id == "shared_with_me" {
+                                        "sharedWithMe = true and trashed = false".to_string()
+                                    } else {
+                                        format!("'{}' in parents and trashed = false", parent_id)
+                                    };
+                                    fetch_files(c, t, q, txc).await;
+                                });
+                            }
                         } else {
                             app.status = "Already at root.".into();
                         }
@@ -677,7 +772,7 @@ pub fn handle_input(
                             }
                         }
                         app.next();
-                        trigger_preview(app, &client, &token.access_token, &tx);
+                        trigger_preview(app, client, &token.access_token, tx);
                     }
                     KeyCode::Char('A') => {
                         app.selected_files.clear();
@@ -834,8 +929,14 @@ pub fn handle_action(
                 let token_c = token.access_token.clone();
                 let current = app.current_path.clone();
                 tokio::spawn(async move {
-                    let q = format!("'{}' in parents and trashed = false", current);
-                    crate::api::fetch_files(client_c, token_c, q, txc).await;
+                    if current != "virtual_root" {
+                        let q = if current == "shared_with_me" {
+                            "sharedWithMe = true and trashed = false".to_string()
+                        } else {
+                            format!("'{}' in parents and trashed = false", current)
+                        };
+                        crate::api::fetch_files(client_c, token_c, q, txc).await;
+                    }
                 });
             }
         }
@@ -917,11 +1018,22 @@ pub fn handle_action(
             app.status = msg;
         }
         Action::ImagePreview(bytes) => {
-            if app.show_preview {
+            if app.preview_mode != crate::app::PreviewMode::Hidden {
                 if let Ok(img) = image::load_from_memory(&bytes) {
                     app.preview_dims = Some((img.width(), img.height()));
-                    app.preview_image = Some(app.picker.new_resize_protocol(img));
+                    app.preview_state =
+                        crate::app::PreviewState::Image(app.picker.new_resize_protocol(img));
                 }
+            }
+        }
+        Action::PreviewMetadataLoaded(name, size, created, modified) => {
+            if app.preview_mode != crate::app::PreviewMode::Hidden {
+                app.preview_state = crate::app::PreviewState::Metadata {
+                    name,
+                    size,
+                    created,
+                    modified,
+                };
             }
         }
     }

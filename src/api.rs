@@ -363,3 +363,49 @@ pub async fn upload_file(
             .await;
     }
 }
+
+pub async fn fetch_metadata(
+    client: Client,
+    access_token: String,
+    file_id: String,
+    tx: mpsc::Sender<Event>,
+) {
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}?fields=name,size,createdTime,modifiedTime",
+        file_id
+    );
+    match client.get(&url).bearer_auth(&access_token).send().await {
+        Ok(res) if res.status().is_success() => {
+            #[derive(serde::Deserialize)]
+            struct MetadataResponse {
+                name: String,
+                size: Option<String>,
+                #[serde(rename = "createdTime")]
+                created_time: Option<String>,
+                #[serde(rename = "modifiedTime")]
+                modified_time: Option<String>,
+            }
+            if let Ok(data) = res.json::<MetadataResponse>().await {
+                let size = data.size.and_then(|s| s.parse::<u64>().ok());
+                let created = data.created_time.unwrap_or_else(|| "Unknown".to_string());
+                let modified = data.modified_time.unwrap_or_else(|| "Unknown".to_string());
+                let _ = tx
+                    .send(Event::Action(crate::app::Action::PreviewMetadataLoaded(
+                        data.name, size, created, modified,
+                    )))
+                    .await;
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn format_time(rfc3339: &str) -> String {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        dt.with_timezone(&chrono::Local)
+            .format("%d %b %Y, %I:%M %p")
+            .to_string()
+    } else {
+        rfc3339.to_string()
+    }
+}

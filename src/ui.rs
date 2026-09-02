@@ -174,40 +174,113 @@ pub fn render(f: &mut Frame, app: &mut App) {
         crate::download::render_tracker_block(f, chunks[1], app);
     } else if app.input_mode == crate::app::InputMode::UploadTrackerView {
         crate::upload::render_tracker_block(f, chunks[1], app);
-    } else if app.show_preview {
-        let available_height = chunks[1].height.saturating_sub(2); // borders
+    } else if app.preview_mode != crate::app::PreviewMode::Hidden {
+        match &mut app.preview_state {
+            crate::app::PreviewState::Image(ref mut protocol) => {
+                let available_height = chunks[1].height.saturating_sub(2); // borders
+                let preview_width = if let Some((img_w, img_h)) = app.preview_dims {
+                    let font_ratio = 2.0_f64;
+                    if img_h > 0 {
+                        let cols =
+                            (img_w as f64 * available_height as f64 * font_ratio) / (img_h as f64);
+                        (cols.ceil() as u16).saturating_add(2)
+                    } else {
+                        (chunks[1].width / 2).max(20)
+                    }
+                } else {
+                    (chunks[1].width / 2).max(20)
+                };
 
-        let preview_width = if let Some((img_w, img_h)) = app.preview_dims {
-            // Terminal cells universally have a roughly 1:2 aspect ratio (width:height).
-            // The exact pixel size doesn't matter, only the ratio for calculating column width.
-            let font_ratio = 2.0_f64; // height / width
+                let center_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(20), Constraint::Length(preview_width)])
+                    .split(chunks[1]);
 
-            if img_h > 0 {
-                let cols = (img_w as f64 * available_height as f64 * font_ratio) / (img_h as f64);
-                (cols.ceil() as u16).saturating_add(2) // +2 for borders
-            } else {
-                (chunks[1].width / 2).max(20)
+                f.render_stateful_widget(list, center_chunks[0], &mut app.state);
+
+                let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
+                let inner_area = preview_block.inner(center_chunks[1]);
+                f.render_widget(preview_block, center_chunks[1]);
+
+                use ratatui_image::StatefulImage;
+                f.render_stateful_widget(StatefulImage::new(), inner_area, protocol);
             }
-        } else {
-            (chunks[1].width / 2).max(20)
-        };
+            crate::app::PreviewState::Metadata {
+                name,
+                size,
+                created,
+                modified,
+            } => {
+                let center_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
+                    .split(chunks[1]);
+                f.render_stateful_widget(list, center_chunks[0], &mut app.state);
 
-        let center_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(20), Constraint::Length(preview_width)])
-            .split(chunks[1]);
-
-        f.render_stateful_widget(list, center_chunks[0], &mut app.state);
-
-        let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
-        let inner_area = preview_block.inner(center_chunks[1]);
-        f.render_widget(preview_block, center_chunks[1]);
-
-        if let Some(ref mut protocol) = app.preview_image {
-            use ratatui_image::StatefulImage;
-            f.render_stateful_widget(StatefulImage::new(), inner_area, protocol);
-        } else {
-            f.render_widget(Paragraph::new("Loading or unavailable..."), inner_area);
+                let preview_block = Block::default().borders(Borders::ALL).title(" Metadata ");
+                let text = vec![
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "Name: ",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        ratatui::text::Span::raw(name.clone()),
+                    ]),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "Size: ",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        ratatui::text::Span::raw(if let Some(s) = size {
+                            format_bytes(*s)
+                        } else {
+                            "-".to_string()
+                        }),
+                    ]),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "Created: ",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        ratatui::text::Span::raw(crate::api::format_time(created)),
+                    ]),
+                    Line::from(vec![
+                        ratatui::text::Span::styled(
+                            "Modified: ",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        ratatui::text::Span::raw(crate::api::format_time(modified)),
+                    ]),
+                ];
+                let p = Paragraph::new(text)
+                    .block(preview_block)
+                    .wrap(ratatui::widgets::Wrap { trim: true });
+                f.render_widget(p, center_chunks[1]);
+            }
+            crate::app::PreviewState::Loading => {
+                let center_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
+                    .split(chunks[1]);
+                f.render_stateful_widget(list, center_chunks[0], &mut app.state);
+                let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
+                f.render_widget(
+                    Paragraph::new("Loading preview...").block(preview_block),
+                    center_chunks[1],
+                );
+            }
+            crate::app::PreviewState::None => {
+                let center_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
+                    .split(chunks[1]);
+                f.render_stateful_widget(list, center_chunks[0], &mut app.state);
+                let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
+                f.render_widget(
+                    Paragraph::new("No preview available.").block(preview_block),
+                    center_chunks[1],
+                );
+            }
         }
     } else {
         f.render_stateful_widget(list, chunks[1], &mut app.state);

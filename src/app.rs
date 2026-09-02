@@ -11,6 +11,18 @@ pub struct DriveFile {
 }
 
 /// Represents background network actions that update the UI
+pub enum PreviewState {
+    None,
+    Loading,
+    Image(ratatui_image::protocol::StatefulProtocol),
+    Metadata {
+        name: String,
+        size: Option<u64>,
+        created: String,
+        modified: String,
+    },
+}
+
 pub enum Action {
     LoadFiles(Vec<DriveFile>),
     LoadTrash(Vec<DriveFile>),
@@ -19,6 +31,7 @@ pub enum Action {
     LoadQuota(u64, u64), // (used, limit)
     UploadComplete(String),
     ImagePreview(Vec<u8>),
+    PreviewMetadataLoaded(String, Option<u64>, String, String),
     QueueUploads(Vec<UploadTask>),
     TokenRefreshed(crate::auth::Token),
     UpdateUploadProgress(String, u64, u64, f64), // local_path, uploaded, total, speed
@@ -116,6 +129,13 @@ impl DownloadManager {
 }
 
 /// Core application state
+#[derive(PartialEq, Clone, Copy)]
+pub enum PreviewMode {
+    Hidden,
+    Default,
+    ForceMetadata,
+}
+
 pub struct App {
     pub files: Vec<DriveFile>,
     pub dl_manager: DownloadManager,
@@ -135,8 +155,8 @@ pub struct App {
     pub history: Vec<String>,
     pub path_names: Vec<String>,
     pub storage_quota: Option<(u64, u64)>,
-    pub show_preview: bool,
-    pub preview_image: Option<ratatui_image::protocol::StatefulProtocol>,
+    pub preview_mode: PreviewMode,
+    pub preview_state: PreviewState,
     pub preview_dims: Option<(u32, u32)>,
     pub picker: ratatui_image::picker::Picker,
     pub input_mode: InputMode,
@@ -216,17 +236,17 @@ impl App {
             selected_files: HashSet::new(),
             state,
             trash_state: ListState::default(),
-            current_path: "root".to_string(),
+            current_path: "virtual_root".to_string(),
             status: "Loading...".to_string(),
             should_quit: false,
             download_progress: None,
             search_mode: false,
             search_query: String::new(),
             history: Vec::new(),
-            path_names: vec!["root".to_string()],
+            path_names: vec!["virtual_root".to_string()],
             storage_quota: None,
-            show_preview: false,
-            preview_image: None,
+            preview_mode: PreviewMode::Hidden,
+            preview_state: PreviewState::None,
             preview_dims: None,
             picker: ratatui_image::picker::Picker::from_query_stdio()
                 .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),

@@ -8,7 +8,7 @@ mod ui;
 mod upload;
 
 use anyhow::Result;
-use api::{fetch_files, fetch_preview, fetch_quota};
+use api::fetch_quota;
 use app::{App, Event};
 use auth::{authenticate, AuthInfo};
 use crossterm::{
@@ -105,14 +105,20 @@ async fn main() -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel(32);
 
-    // Initial fetch
-    let client_clone = client.clone();
-    let token_clone = token.access_token.clone();
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        let q = "'root' in parents and trashed = false".to_string();
-        fetch_files(client_clone, token_clone, q, tx_clone).await;
-    });
+    // Initialize Virtual Root
+    app.files = vec![
+        crate::app::DriveFile {
+            id: "root".to_string(),
+            name: "My Drive".to_string(),
+            mime_type: "application/vnd.google-apps.folder".to_string(),
+        },
+        crate::app::DriveFile {
+            id: "shared_with_me".to_string(),
+            name: "Shared with me".to_string(),
+            mime_type: "application/vnd.google-apps.folder".to_string(),
+        },
+    ];
+    app.status = "Virtual Root loaded.".to_string();
 
     let client_quota = client.clone();
     let token_quota = token.access_token.clone();
@@ -201,20 +207,29 @@ pub(crate) fn trigger_preview(
     token: &str,
     tx: &mpsc::Sender<Event>,
 ) {
-    if !app.show_preview {
+    if app.preview_mode == crate::app::PreviewMode::Hidden {
         return;
     }
-    app.preview_image = None; // clear old preview
+    app.preview_state = crate::app::PreviewState::Loading;
     app.preview_dims = None;
     if let Some(file) = app.selected_file() {
-        if file.mime_type.starts_with("image/") {
-            let c = client.clone();
-            let t = token.to_string();
-            let fid = file.id.clone();
-            let txc = tx.clone();
+        let c = client.clone();
+        let t = token.to_string();
+        let fid = file.id.clone();
+        let txc = tx.clone();
+
+        if file.mime_type.starts_with("image/")
+            && app.preview_mode == crate::app::PreviewMode::Default
+        {
             tokio::spawn(async move {
-                fetch_preview(c, t, fid, txc).await;
+                crate::api::fetch_preview(c, t, fid, txc).await;
             });
+        } else if file.mime_type != "application/vnd.google-apps.folder" {
+            tokio::spawn(async move {
+                crate::api::fetch_metadata(c, t, fid, txc).await;
+            });
+        } else {
+            app.preview_state = crate::app::PreviewState::None;
         }
     }
 }

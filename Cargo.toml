@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.86"
 bytes = "1.12.1"
+chrono = "0.4.45"
 crossterm = "0.29.0"
 directories = "5.0.1"
 futures-util = "0.3.34"
