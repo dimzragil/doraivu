@@ -4,8 +4,6 @@
 **Pure Rust TUI for Google Drive**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/dimzragil/doraivu/rust.yml?branch=main)](https://github.com/dimzragil/doraivu/actions)
-[![Crates.io](https://img.shields.io/crates/v/doraivu.svg)](https://crates.io/crates/doraivu)
 
 </div>
 
@@ -68,9 +66,3 @@ Doraivu is designed with Vim-style navigation in mind. No mouse needed!
 | `T` | Open Trash | View trashed items (Restore or Delete Permanently) |
 | `r` | Refresh | Refresh current directory and quota |
 | `q` | Quit | Exit Doraivu safely |
-
----
-
-<div align="center">
-  <i>Made with 🦀 for Terminal lovers.</i>
-</div>
