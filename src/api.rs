@@ -136,8 +136,8 @@ pub async fn fetch_preview(
     }
 }
 
-/// Uploads a file using multipart
-
+/// Resolves a path like "/folder/subfolder" into a Google Drive folder ID,
+/// creating folders along the way if they don't exist.
 async fn resolve_or_create_path(
     client: &Client,
     access_token: &str,

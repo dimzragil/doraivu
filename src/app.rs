@@ -1,5 +1,5 @@
 use ratatui::widgets::ListState;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 /// Represents a file or folder from Google Drive
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -70,7 +70,7 @@ pub struct UploadTask {
 
 pub struct UploadManager {
     pub queue: Vec<UploadTask>,
-    pub speed_history: Vec<u64>,
+    pub speed_history: VecDeque<u64>,
     pub state: ratatui::widgets::ListState,
 }
 
@@ -78,7 +78,7 @@ impl UploadManager {
     pub fn new() -> Self {
         Self {
             queue: Vec::new(),
-            speed_history: vec![0; 100],
+            speed_history: VecDeque::from(vec![0; 100]),
             state: ratatui::widgets::ListState::default(),
         }
     }
@@ -101,7 +101,7 @@ pub struct DownloadTask {
 
 pub struct DownloadManager {
     pub queue: Vec<DownloadTask>,
-    pub speed_history: Vec<u64>,
+    pub speed_history: VecDeque<u64>,
     pub state: ratatui::widgets::ListState,
 }
 
@@ -109,7 +109,7 @@ impl DownloadManager {
     pub fn new() -> Self {
         Self {
             queue: Vec::new(),
-            speed_history: vec![0; 100],
+            speed_history: VecDeque::from(vec![0; 100]),
             state: ratatui::widgets::ListState::default(),
         }
     }
@@ -156,6 +156,10 @@ impl App {
     pub fn save_queues(&self) {
         if let Ok(config_dir) = crate::auth::get_config_dir() {
             let path = config_dir.join("queues.json");
+            if self.dl_manager.queue.is_empty() && self.ul_manager.queue.is_empty() {
+                let _ = std::fs::remove_file(&path);
+                return;
+            }
             #[derive(serde::Serialize)]
             struct Queues<'a> {
                 downloads: &'a Vec<DownloadTask>,

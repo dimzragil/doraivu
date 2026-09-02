@@ -40,7 +40,7 @@ pub async fn upload_file_task(
     tokio::spawn(async move {
         let mut framed = FramedRead::new(file, BytesCodec::new());
         let mut uploaded = 0;
-        let start_time = std::time::Instant::now();
+        let mut last_uploaded = 0u64;
         let mut last_update = std::time::Instant::now();
 
         while let Some(chunk_res) = futures_util::StreamExt::next(&mut framed).await {
@@ -57,10 +57,10 @@ pub async fn upload_file_task(
                     uploaded += len;
 
                     let now = std::time::Instant::now();
-                    if now.duration_since(last_update).as_millis() > 100 {
-                        let elapsed = now.duration_since(start_time).as_secs_f64();
+                    let elapsed = now.duration_since(last_update).as_secs_f64();
+                    if elapsed >= 0.1 {
                         let speed = if elapsed > 0.0 {
-                            uploaded as f64 / elapsed
+                            (uploaded - last_uploaded) as f64 / elapsed
                         } else {
                             0.0
                         };
@@ -73,6 +73,7 @@ pub async fn upload_file_task(
                             )))
                             .await;
                         last_update = now;
+                        last_uploaded = uploaded;
                     }
                 }
                 Err(e) => {

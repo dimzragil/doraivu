@@ -914,9 +914,9 @@ async fn main() -> Result<()> {
                             task.downloaded_bytes = dl;
                             task.total_bytes = total;
                         }
-                        app.dl_manager.speed_history.push(speed as u64);
+                        app.dl_manager.speed_history.push_back(speed as u64);
                         if app.dl_manager.speed_history.len() > 100 {
-                            app.dl_manager.speed_history.remove(0);
+                            app.dl_manager.speed_history.pop_front();
                         }
                         // Keep legacy global progress updated
                         app.download_progress = Some((dl, total, speed));
@@ -952,9 +952,9 @@ async fn main() -> Result<()> {
                             task.uploaded_bytes = downloaded;
                             task.total_bytes = total;
                         }
-                        app.ul_manager.speed_history.push(speed as u64);
+                        app.ul_manager.speed_history.push_back(speed as u64);
                         if app.ul_manager.speed_history.len() > 100 {
-                            app.ul_manager.speed_history.remove(0);
+                            app.ul_manager.speed_history.pop_front();
                         }
                         app.upload_progress = Some((downloaded, total, speed));
                     }
@@ -992,8 +992,9 @@ async fn main() -> Result<()> {
                             let txc = tx.clone();
                             let client_c = client.clone();
                             let token_c = token.access_token.clone();
+                            let current = app.current_path.clone();
                             tokio::spawn(async move {
-                                let q = "'root' in parents and trashed = false".to_string();
+                                let q = format!("'{}' in parents and trashed = false", current);
                                 crate::api::fetch_files(client_c, token_c, q, txc).await;
                             });
                         }
