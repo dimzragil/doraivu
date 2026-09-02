@@ -1,8 +1,10 @@
 mod api;
 mod app;
 mod auth;
+mod download;
 mod trash;
 mod ui;
+mod upload;
 
 use anyhow::Result;
 use api::{fetch_files, fetch_preview, fetch_quota, upload_file};
@@ -98,6 +100,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
+    app.load_queues();
 
     let (tx, mut rx) = mpsc::channel(32);
 
@@ -120,13 +123,28 @@ async fn main() -> Result<()> {
     // Input thread
     let tx_input = tx.clone();
     tokio::spawn(async move {
+        let mut last_tick = std::time::Instant::now();
         loop {
             if event::poll(Duration::from_millis(250)).unwrap_or(false) {
-                if let Ok(CEvent::Key(key)) = event::read() {
-                    if tx_input.send(Event::Input(key)).await.is_err() {
+                match event::read() {
+                    Ok(CEvent::Key(key)) => {
+                        if tx_input.send(Event::Input(key)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(CEvent::Resize(w, h))
+                        if tx_input.send(Event::Resize(w, h)).await.is_err() =>
+                    {
                         break;
                     }
+                    _ => {}
                 }
+            }
+            if last_tick.elapsed().as_secs() >= 5 {
+                if tx_input.send(Event::Tick).await.is_err() {
+                    break;
+                }
+                last_tick = std::time::Instant::now();
             }
         }
     });
@@ -137,6 +155,12 @@ async fn main() -> Result<()> {
 
         if let Some(event) = rx.recv().await {
             match event {
+                Event::Tick => {
+                    app.save_queues();
+                }
+                Event::Resize(_w, _h) => {
+                    let _ = terminal.clear();
+                }
                 Event::Input(key) => match app.input_mode {
                     app::InputMode::TrashView => match key.code {
                         KeyCode::Esc => {
@@ -228,18 +252,36 @@ async fn main() -> Result<()> {
                     },
                     app::InputMode::DeleteConfirmModal => match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                            if let Some(file) = app.selected_file().cloned() {
-                                app.status = format!("Trashing {}...", file.name);
-                                let c = client.clone();
-                                let t = token.access_token.clone();
-                                let txc = tx.clone();
-                                if let Some(i) = app.state.selected() {
-                                    app.files.remove(i);
+                            let targets: Vec<crate::app::DriveFile> =
+                                if !app.selected_files.is_empty() {
+                                    app.files
+                                        .iter()
+                                        .filter(|f| app.selected_files.contains(&f.id))
+                                        .cloned()
+                                        .collect()
+                                } else if let Some(file) = app.selected_file().cloned() {
+                                    vec![file]
+                                } else {
+                                    vec![]
+                                };
+
+                            app.status = format!("Trashing {} files...", targets.len());
+                            let c = client.clone();
+                            let t = token.access_token.clone();
+                            let txc = tx.clone();
+
+                            // Remove from UI immediately
+                            app.files
+                                .retain(|f| !targets.iter().any(|tf| tf.id == f.id));
+                            app.selected_files.clear();
+
+                            tokio::spawn(async move {
+                                for file in targets {
+                                    api::trash_file(c.clone(), t.clone(), file.id, txc.clone())
+                                        .await;
                                 }
-                                tokio::spawn(async move {
-                                    api::trash_file(c, t, file.id, txc).await;
-                                });
-                            }
+                            });
+
                             app.input_mode = app::InputMode::Normal;
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -249,15 +291,29 @@ async fn main() -> Result<()> {
                     },
                     app::InputMode::DownloadConfirmModal => match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                            if let Some(file) = app.selected_file().cloned() {
-                                app.download_progress = Some((0, 0, 0.0));
-                                let c = client.clone();
-                                let t = token.access_token.clone();
-                                let txc = tx.clone();
-                                tokio::spawn(async move {
-                                    api::download_file(c, t, file, txc).await;
-                                });
-                            }
+                            let targets: Vec<crate::app::DriveFile> =
+                                if !app.selected_files.is_empty() {
+                                    app.files
+                                        .iter()
+                                        .filter(|f| app.selected_files.contains(&f.id))
+                                        .cloned()
+                                        .collect()
+                                } else if let Some(file) = app.selected_file().cloned() {
+                                    vec![file]
+                                } else {
+                                    vec![]
+                                };
+
+                            app.status = format!("Queued {} files for download.", targets.len());
+                            app.selected_files.clear();
+                            let txc = tx.clone();
+                            tokio::spawn(async move {
+                                let _ = txc
+                                    .send(crate::app::Event::Action(
+                                        crate::app::Action::QueueDownloads(targets),
+                                    ))
+                                    .await;
+                            });
                             app.input_mode = app::InputMode::Normal;
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -266,6 +322,275 @@ async fn main() -> Result<()> {
                         _ => {}
                     },
 
+                    app::InputMode::UploadTrackerView => match key.code {
+                        KeyCode::Esc => {
+                            app.input_mode = app::InputMode::Normal;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            let i = match app.ul_manager.state.selected() {
+                                Some(i) => {
+                                    if i >= app.ul_manager.queue.len().saturating_sub(1) {
+                                        i
+                                    } else {
+                                        i + 1
+                                    }
+                                }
+                                None => 0,
+                            };
+                            app.ul_manager.state.select(Some(i));
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            let i = match app.ul_manager.state.selected() {
+                                Some(i) => {
+                                    if i == 0 {
+                                        0
+                                    } else {
+                                        i - 1
+                                    }
+                                }
+                                None => 0,
+                            };
+                            app.ul_manager.state.select(Some(i));
+                        }
+                        KeyCode::Char('x') | KeyCode::Delete => {
+                            if let Some(i) = app.ul_manager.state.selected() {
+                                if i < app.ul_manager.queue.len() {
+                                    let task = &app.ul_manager.queue[i];
+                                    if task.status == crate::app::UploadStatus::Uploading {
+                                        if let Some(handle) = app.active_ul_task.take() {
+                                            handle.abort();
+                                        }
+                                    }
+                                    app.ul_manager.queue.remove(i);
+                                    if app.ul_manager.queue.is_empty() {
+                                        app.ul_manager.state.select(None);
+                                    } else {
+                                        app.ul_manager
+                                            .state
+                                            .select(Some(i.min(app.ul_manager.queue.len() - 1)));
+                                    }
+
+                                    if let Some(first) = app
+                                        .ul_manager
+                                        .queue
+                                        .iter_mut()
+                                        .find(|t| t.status == crate::app::UploadStatus::Pending)
+                                    {
+                                        first.status = crate::app::UploadStatus::Uploading;
+                                        let task_clone = first.clone();
+                                        let client_c = client.clone();
+                                        let token_c = token.access_token.clone();
+                                        let tx_c = tx.clone();
+                                        app.active_ul_task = Some(tokio::spawn(async move {
+                                            upload::upload_file_task(
+                                                client_c, token_c, task_clone, tx_c,
+                                            )
+                                            .await;
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('p') => {
+                            if let Some(i) = app.ul_manager.state.selected() {
+                                if i < app.ul_manager.queue.len()
+                                    && app.ul_manager.queue[i].status
+                                        == crate::app::UploadStatus::Uploading
+                                {
+                                    app.ul_manager.queue[i].status =
+                                        crate::app::UploadStatus::Paused;
+                                    if let Some(handle) = app.active_ul_task.take() {
+                                        handle.abort();
+                                    }
+
+                                    if let Some(first) = app
+                                        .ul_manager
+                                        .queue
+                                        .iter_mut()
+                                        .find(|t| t.status == crate::app::UploadStatus::Pending)
+                                    {
+                                        first.status = crate::app::UploadStatus::Uploading;
+                                        let task_clone = first.clone();
+                                        let client_c = client.clone();
+                                        let token_c = token.access_token.clone();
+                                        let tx_c = tx.clone();
+                                        app.active_ul_task = Some(tokio::spawn(async move {
+                                            upload::upload_file_task(
+                                                client_c, token_c, task_clone, tx_c,
+                                            )
+                                            .await;
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            if let Some(i) = app.ul_manager.state.selected() {
+                                if i < app.ul_manager.queue.len()
+                                    && app.ul_manager.queue[i].status
+                                        == crate::app::UploadStatus::Paused
+                                {
+                                    app.ul_manager.queue[i].status =
+                                        crate::app::UploadStatus::Pending;
+                                    if app.active_ul_task.is_none() {
+                                        if let Some(first) =
+                                            app.ul_manager.queue.iter_mut().find(|t| {
+                                                t.status == crate::app::UploadStatus::Pending
+                                            })
+                                        {
+                                            first.status = crate::app::UploadStatus::Uploading;
+                                            let task_clone = first.clone();
+                                            let client_c = client.clone();
+                                            let token_c = token.access_token.clone();
+                                            let tx_c = tx.clone();
+                                            app.active_ul_task = Some(tokio::spawn(async move {
+                                                upload::upload_file_task(
+                                                    client_c, token_c, task_clone, tx_c,
+                                                )
+                                                .await;
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    app::InputMode::DownloadTrackerView => match key.code {
+                        KeyCode::Esc => {
+                            app.input_mode = app::InputMode::Normal;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !app.dl_manager.queue.is_empty() {
+                                let i = match app.dl_manager.state.selected() {
+                                    Some(i) => {
+                                        if i >= app.dl_manager.queue.len() - 1 {
+                                            app.dl_manager.queue.len() - 1
+                                        } else {
+                                            i + 1
+                                        }
+                                    }
+                                    None => 0,
+                                };
+                                app.dl_manager.state.select(Some(i));
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            if !app.dl_manager.queue.is_empty() {
+                                let i = match app.dl_manager.state.selected() {
+                                    Some(i) => i.saturating_sub(1),
+                                    None => 0,
+                                };
+                                app.dl_manager.state.select(Some(i));
+                            }
+                        }
+                        KeyCode::Char('x') | KeyCode::Delete => {
+                            if let Some(i) = app.dl_manager.state.selected() {
+                                if i < app.dl_manager.queue.len() {
+                                    let item = &app.dl_manager.queue[i];
+                                    if item.status == crate::app::DownloadStatus::Downloading {
+                                        if let Some(task) = app.active_dl_task.take() {
+                                            task.abort();
+                                        }
+                                    }
+                                    app.dl_manager.queue.remove(i);
+
+                                    // Start next if we aborted the active one
+                                    if app.active_dl_task.is_none() {
+                                        if let Some(first) =
+                                            app.dl_manager.queue.iter_mut().find(|t| {
+                                                t.status != crate::app::DownloadStatus::Paused
+                                            })
+                                        {
+                                            first.status = crate::app::DownloadStatus::Downloading;
+                                            let c = client.clone();
+                                            let t = token.access_token.clone();
+                                            let txc = tx.clone();
+                                            let f = first.file.clone();
+                                            let start_bytes = first.downloaded_bytes;
+                                            app.active_dl_task = Some(tokio::spawn(async move {
+                                                crate::download::download_file_ranged(
+                                                    c,
+                                                    t,
+                                                    f,
+                                                    start_bytes,
+                                                    txc,
+                                                )
+                                                .await;
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('p') => {
+                            if let Some(i) = app.dl_manager.state.selected() {
+                                if let Some(item) = app.dl_manager.queue.get_mut(i) {
+                                    if item.status == crate::app::DownloadStatus::Downloading {
+                                        item.status = crate::app::DownloadStatus::Paused;
+                                        if let Some(task) = app.active_dl_task.take() {
+                                            task.abort();
+                                        }
+                                        app.status = "Download paused.".into();
+
+                                        // Start next pending if available
+                                        if let Some(first) =
+                                            app.dl_manager.queue.iter_mut().find(|t| {
+                                                t.status == crate::app::DownloadStatus::Pending
+                                            })
+                                        {
+                                            first.status = crate::app::DownloadStatus::Downloading;
+                                            let c = client.clone();
+                                            let t = token.access_token.clone();
+                                            let txc = tx.clone();
+                                            let f = first.file.clone();
+                                            let start_bytes = first.downloaded_bytes;
+                                            app.active_dl_task = Some(tokio::spawn(async move {
+                                                crate::download::download_file_ranged(
+                                                    c,
+                                                    t,
+                                                    f,
+                                                    start_bytes,
+                                                    txc,
+                                                )
+                                                .await;
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            if let Some(i) = app.dl_manager.state.selected() {
+                                if let Some(item) = app.dl_manager.queue.get_mut(i) {
+                                    if item.status == crate::app::DownloadStatus::Paused {
+                                        item.status = crate::app::DownloadStatus::Pending;
+                                        app.status = "Download queued for resume.".into();
+
+                                        if app.active_dl_task.is_none() {
+                                            item.status = crate::app::DownloadStatus::Downloading;
+                                            let c = client.clone();
+                                            let t = token.access_token.clone();
+                                            let txc = tx.clone();
+                                            let f = item.file.clone();
+                                            let start_bytes = item.downloaded_bytes;
+                                            app.active_dl_task = Some(tokio::spawn(async move {
+                                                crate::download::download_file_ranged(
+                                                    c,
+                                                    t,
+                                                    f,
+                                                    start_bytes,
+                                                    txc,
+                                                )
+                                                .await;
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
                     app::InputMode::UploadModal => match key.code {
                         KeyCode::Esc => {
                             app.input_mode = app::InputMode::Normal;
@@ -351,7 +676,10 @@ async fn main() -> Result<()> {
                             }
                         } else {
                             match key.code {
-                                KeyCode::Char('q') => app.should_quit = true,
+                                KeyCode::Char('q') => {
+                                    app.save_queues();
+                                    app.should_quit = true;
+                                }
                                 KeyCode::Char('j') | KeyCode::Down => {
                                     app.next();
                                     trigger_preview(&mut app, &client, &token.access_token, &tx);
@@ -367,6 +695,7 @@ async fn main() -> Result<()> {
                                 KeyCode::Char('r') => {
                                     app.status = "Refreshing...".into();
                                     app.files.clear();
+                                    app.selected_files.clear();
                                     let c = client.clone();
                                     let t = token.access_token.clone();
                                     let txc = tx.clone();
@@ -448,6 +777,7 @@ async fn main() -> Result<()> {
                                         app.current_path = parent_id.clone();
                                         app.status = "Going back...".into();
                                         app.files.clear();
+                                        app.selected_files.clear();
 
                                         let c = client.clone();
                                         let t = token.access_token.clone();
@@ -479,6 +809,12 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
+                                KeyCode::Char('D') => {
+                                    app.input_mode = app::InputMode::DownloadTrackerView;
+                                }
+                                KeyCode::Char('U') => {
+                                    app.input_mode = app::InputMode::UploadTrackerView;
+                                }
                                 KeyCode::Char('u') => {
                                     app.input_mode = app::InputMode::UploadModal;
                                     if app.path_names.len() == 1 {
@@ -497,6 +833,20 @@ async fn main() -> Result<()> {
                                         format!("{}/", home)
                                     };
                                 }
+                                KeyCode::Char('a') => {
+                                    if let Some(file) = app.selected_file() {
+                                        if app.selected_files.contains(&file.id) {
+                                            app.selected_files.remove(&file.id.clone());
+                                        } else {
+                                            app.selected_files.insert(file.id.clone());
+                                        }
+                                    }
+                                    app.next();
+                                    trigger_preview(&mut app, &client, &token.access_token, &tx);
+                                }
+                                KeyCode::Char('A') => {
+                                    app.selected_files.clear();
+                                }
                                 KeyCode::Char('e') => {
                                     if let Some(file) = app.selected_file().cloned() {
                                         if file.mime_type != "application/vnd.google-apps.folder" {
@@ -512,6 +862,10 @@ async fn main() -> Result<()> {
                     }
                 },
                 Event::Action(action) => match action {
+                    Action::TokenRefreshed(new_token) => {
+                        token = new_token;
+                        app.status = "Token refreshed successfully!".to_string();
+                    }
                     Action::LoadFiles(files) => {
                         app.files = files;
                         app.status = format!("Loaded {} items.", app.files.len());
@@ -530,25 +884,194 @@ async fn main() -> Result<()> {
                     Action::Message(msg) => {
                         app.status = msg;
                     }
+                    Action::QueueDownloads(files) => {
+                        for f in files {
+                            app.dl_manager.queue.push(crate::app::DownloadTask {
+                                file: f,
+                                total_bytes: 0,
+                                downloaded_bytes: 0,
+                                status: crate::app::DownloadStatus::Pending,
+                            });
+                        }
+                        // Start if none active
+                        if app.active_dl_task.is_none() {
+                            if let Some(first) = app.dl_manager.queue.first_mut() {
+                                first.status = crate::app::DownloadStatus::Downloading;
+                                let c = client.clone();
+                                let t = token.access_token.clone();
+                                let txc = tx.clone();
+                                let f = first.file.clone();
+                                app.active_dl_task = Some(tokio::spawn(async move {
+                                    crate::download::download_file_ranged(c, t, f, 0, txc).await;
+                                }));
+                            }
+                        }
+                    }
+                    Action::UpdateDownloadProgress(id, dl, total, speed) => {
+                        if let Some(task) =
+                            app.dl_manager.queue.iter_mut().find(|t| t.file.id == id)
+                        {
+                            task.downloaded_bytes = dl;
+                            task.total_bytes = total;
+                        }
+                        app.dl_manager.speed_history.push(speed as u64);
+                        if app.dl_manager.speed_history.len() > 100 {
+                            app.dl_manager.speed_history.remove(0);
+                        }
+                        // Keep legacy global progress updated
+                        app.download_progress = Some((dl, total, speed));
+                    }
+                    Action::QueueUploads(tasks) => {
+                        for t in tasks {
+                            app.ul_manager.queue.push(t);
+                        }
+                        if app.active_ul_task.is_none() {
+                            if let Some(first) = app
+                                .ul_manager
+                                .queue
+                                .iter_mut()
+                                .find(|t| t.status == crate::app::UploadStatus::Pending)
+                            {
+                                first.status = crate::app::UploadStatus::Uploading;
+                                let task_clone = first.clone();
+                                let client_c = client.clone();
+                                let token_c = token.access_token.clone();
+                                let tx_c = tx.clone();
+                                app.active_ul_task = Some(tokio::spawn(async move {
+                                    upload::upload_file_task(client_c, token_c, task_clone, tx_c)
+                                        .await;
+                                }));
+                            }
+                        }
+                        app.status = format!("{} upload(s) queued.", app.ul_manager.queue.len());
+                    }
+                    Action::UpdateUploadProgress(id, downloaded, total, speed) => {
+                        if let Some(task) =
+                            app.ul_manager.queue.iter_mut().find(|t| t.local_path == id)
+                        {
+                            task.uploaded_bytes = downloaded;
+                            task.total_bytes = total;
+                        }
+                        app.ul_manager.speed_history.push(speed as u64);
+                        if app.ul_manager.speed_history.len() > 100 {
+                            app.ul_manager.speed_history.remove(0);
+                        }
+                        app.upload_progress = Some((downloaded, total, speed));
+                    }
+                    Action::CompleteUpload(id) => {
+                        app.ul_manager.queue.retain(|t| t.local_path != id);
+                        app.active_ul_task = None;
+                        app.upload_progress = None;
+
+                        if let Some(first) = app
+                            .ul_manager
+                            .queue
+                            .iter_mut()
+                            .find(|t| t.status == crate::app::UploadStatus::Pending)
+                        {
+                            first.status = crate::app::UploadStatus::Uploading;
+                            let task_clone = first.clone();
+                            let client_c = client.clone();
+                            let token_c = token.access_token.clone();
+                            let tx_c = tx.clone();
+                            app.active_ul_task = Some(tokio::spawn(async move {
+                                upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
+                            }));
+                        } else if !app.ul_manager.queue.is_empty()
+                            && app
+                                .ul_manager
+                                .queue
+                                .iter()
+                                .all(|t| t.status == crate::app::UploadStatus::Paused)
+                        {
+                            app.status = "Uploads paused.".into();
+                        } else if app.ul_manager.queue.is_empty() {
+                            app.status = "All uploads complete.".into();
+
+                            // Automatically fetch files after upload is done!
+                            let txc = tx.clone();
+                            let client_c = client.clone();
+                            let token_c = token.access_token.clone();
+                            tokio::spawn(async move {
+                                let q = "'root' in parents and trashed = false".to_string();
+                                crate::api::fetch_files(client_c, token_c, q, txc).await;
+                            });
+                        }
+                    }
+                    Action::CompleteDownload(id) => {
+                        app.dl_manager.queue.retain(|t| t.file.id != id);
+                        app.active_dl_task = None;
+                        app.download_progress = None;
+
+                        // Start next pending
+                        if let Some(first) = app
+                            .dl_manager
+                            .queue
+                            .iter_mut()
+                            .find(|t| t.status == crate::app::DownloadStatus::Pending)
+                        {
+                            first.status = crate::app::DownloadStatus::Downloading;
+                            let c = client.clone();
+                            let t = token.access_token.clone();
+                            let txc = tx.clone();
+                            let f = first.file.clone();
+                            let start_bytes = first.downloaded_bytes;
+                            app.active_dl_task = Some(tokio::spawn(async move {
+                                crate::download::download_file_ranged(c, t, f, start_bytes, txc)
+                                    .await;
+                            }));
+                        } else if !app.dl_manager.queue.is_empty()
+                            && app
+                                .dl_manager
+                                .queue
+                                .iter()
+                                .all(|t| t.status == crate::app::DownloadStatus::Paused)
+                        {
+                            app.status = "Downloads paused.".into();
+                        } else if app.dl_manager.queue.is_empty() {
+                            app.status = "All downloads complete.".into();
+                        }
+                    }
                     Action::Error(err) => {
                         app.status = format!("Error: {}", err);
                         app.download_progress = None;
                         app.upload_progress = None;
-                    }
-                    Action::DownloadProgress(dl, total, speed) => {
-                        app.download_progress = Some((dl, total, speed));
-                    }
-                    Action::DownloadComplete(msg) => {
-                        app.download_progress = None;
-                        app.status = msg;
+                        if err.contains("401 Unauthorized") {
+                            app.status = "Token expired! Refreshing automatically...".to_string();
+                            let client_c = client.clone();
+                            let mut token_c = token.clone();
+                            let auth_info_c = auth_info.clone();
+                            let tx_c = tx.clone();
+                            tokio::spawn(async move {
+                                match crate::auth::refresh_token_if_needed(
+                                    &client_c,
+                                    &auth_info_c,
+                                    &mut token_c,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        let _ = tx_c
+                                            .send(Event::Action(Action::TokenRefreshed(token_c)))
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx_c
+                                            .send(Event::Action(Action::Error(format!(
+                                                "Refresh failed: {}",
+                                                e
+                                            ))))
+                                            .await;
+                                    }
+                                }
+                            });
+                        }
                     }
 
                     Action::LoadQuota(used, limit) => {
                         app.storage_quota = Some((used, limit));
                     }
-                    Action::UploadProgress(up, total, speed) => {
-                        app.upload_progress = Some((up, total, speed));
-                    }
+
                     Action::UploadComplete(msg) => {
                         app.upload_progress = None;
                         app.status = msg;

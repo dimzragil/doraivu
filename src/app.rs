@@ -1,8 +1,8 @@
 use ratatui::widgets::ListState;
-use serde::Deserialize;
+use std::collections::HashSet;
 
 /// Represents a file or folder from Google Drive
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveFile {
     pub id: String,
@@ -15,13 +15,18 @@ pub enum Action {
     LoadFiles(Vec<DriveFile>),
     LoadTrash(Vec<DriveFile>),
     Error(String),
-    DownloadProgress(u64, u64, f64), // (downloaded, total, speed)
-    DownloadComplete(String),
     Message(String),
-    LoadQuota(u64, u64),           // (used, limit)
-    UploadProgress(u64, u64, f64), // (uploaded, total, speed)
+    LoadQuota(u64, u64), // (used, limit)
     UploadComplete(String),
-    ImagePreview(Vec<u8>), // Fetched image bytes
+    ImagePreview(Vec<u8>),
+    QueueUploads(Vec<UploadTask>),
+    TokenRefreshed(crate::auth::Token),
+    UpdateUploadProgress(String, u64, u64, f64), // local_path, uploaded, total, speed
+    CompleteUpload(String),                      // local_path
+
+    QueueDownloads(Vec<DriveFile>),
+    UpdateDownloadProgress(String, u64, u64, f64), // id, downloaded, total, speed
+    CompleteDownload(String),                      // id
 }
 
 #[derive(PartialEq)]
@@ -33,6 +38,8 @@ pub enum InputMode {
     TrashView,
     TrashDeleteConfirmModal,
     TrashDeleteAllConfirmModal,
+    DownloadTrackerView,
+    UploadTrackerView,
 }
 
 /// Main event enum for the TUI event loop
@@ -40,11 +47,82 @@ pub enum Event {
     Input(crossterm::event::KeyEvent),
     Action(Action),
     SuspendAndEdit(DriveFile),
+    Resize(u16, u16),
+    Tick,
+}
+
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum UploadStatus {
+    Pending,
+    Uploading,
+    Paused,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct UploadTask {
+    pub local_path: String,
+    pub name: String,
+    pub target_parent_id: String,
+    pub total_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub status: UploadStatus,
+}
+
+pub struct UploadManager {
+    pub queue: Vec<UploadTask>,
+    pub speed_history: Vec<u64>,
+    pub state: ratatui::widgets::ListState,
+}
+
+impl UploadManager {
+    pub fn new() -> Self {
+        Self {
+            queue: Vec::new(),
+            speed_history: vec![0; 100],
+            state: ratatui::widgets::ListState::default(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum DownloadStatus {
+    Pending,
+    Downloading,
+    Paused,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DownloadTask {
+    pub file: DriveFile,
+    pub total_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub status: DownloadStatus,
+}
+
+pub struct DownloadManager {
+    pub queue: Vec<DownloadTask>,
+    pub speed_history: Vec<u64>,
+    pub state: ratatui::widgets::ListState,
+}
+
+impl DownloadManager {
+    pub fn new() -> Self {
+        Self {
+            queue: Vec::new(),
+            speed_history: vec![0; 100],
+            state: ratatui::widgets::ListState::default(),
+        }
+    }
 }
 
 /// Core application state
 pub struct App {
     pub files: Vec<DriveFile>,
+    pub dl_manager: DownloadManager,
+    pub active_dl_task: Option<tokio::task::JoinHandle<()>>,
+    pub ul_manager: UploadManager,
+    pub active_ul_task: Option<tokio::task::JoinHandle<()>>,
+    pub selected_files: HashSet<String>,
     pub trashed_files: Vec<DriveFile>,
     pub state: ListState,
     pub trash_state: ListState,
@@ -75,13 +153,63 @@ impl Default for App {
 }
 
 impl App {
+    pub fn save_queues(&self) {
+        if let Ok(config_dir) = crate::auth::get_config_dir() {
+            let path = config_dir.join("queues.json");
+            #[derive(serde::Serialize)]
+            struct Queues<'a> {
+                downloads: &'a Vec<DownloadTask>,
+                uploads: &'a Vec<UploadTask>,
+            }
+            let q = Queues {
+                downloads: &self.dl_manager.queue,
+                uploads: &self.ul_manager.queue,
+            };
+            if let Ok(json) = serde_json::to_string(&q) {
+                let _ = std::fs::write(path, json);
+            }
+        }
+    }
+
+    pub fn load_queues(&mut self) {
+        if let Ok(config_dir) = crate::auth::get_config_dir() {
+            let path = config_dir.join("queues.json");
+            if let Ok(json) = std::fs::read_to_string(path) {
+                #[derive(serde::Deserialize)]
+                struct Queues {
+                    downloads: Vec<DownloadTask>,
+                    uploads: Vec<UploadTask>,
+                }
+                if let Ok(mut q) = serde_json::from_str::<Queues>(&json) {
+                    for task in &mut q.downloads {
+                        if task.status == DownloadStatus::Downloading {
+                            task.status = DownloadStatus::Paused;
+                        }
+                    }
+                    for task in &mut q.uploads {
+                        if task.status == UploadStatus::Uploading {
+                            task.status = UploadStatus::Paused;
+                        }
+                    }
+                    self.dl_manager.queue = q.downloads;
+                    self.ul_manager.queue = q.uploads;
+                }
+            }
+        }
+    }
+
     /// Initializes a new application state
     pub fn new() -> Self {
         let mut state = ListState::default();
         state.select(Some(0));
         Self {
             files: Vec::new(),
+            dl_manager: DownloadManager::new(),
+            active_dl_task: None,
+            ul_manager: UploadManager::new(),
+            active_ul_task: None,
             trashed_files: Vec::new(),
+            selected_files: HashSet::new(),
             state,
             trash_state: ListState::default(),
             current_path: "root".to_string(),

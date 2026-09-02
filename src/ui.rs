@@ -85,10 +85,22 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 "📄"
             };
 
-            let content = Line::from(vec![
-                Span::raw(format!("{} ", icon)),
-                Span::styled(&file.name, Style::default().add_modifier(Modifier::BOLD)),
-            ]);
+            let mut line_spans = vec![];
+            if app.selected_files.contains(&file.id) {
+                line_spans.push(Span::styled(
+                    " ● ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            line_spans.push(Span::raw(format!("{} ", icon)));
+            line_spans.push(Span::styled(
+                &file.name,
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+
+            let content = Line::from(line_spans);
             ListItem::new(content)
         })
         .collect();
@@ -158,6 +170,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
             f.render_widget(p, area);
         }
+    } else if app.input_mode == crate::app::InputMode::DownloadTrackerView {
+        crate::download::render_tracker_block(f, chunks[1], app);
+    } else if app.input_mode == crate::app::InputMode::UploadTrackerView {
+        crate::upload::render_tracker_block(f, chunks[1], app);
     } else if app.show_preview {
         let available_height = chunks[1].height.saturating_sub(2); // borders
 
@@ -219,6 +235,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             format_bytes(total),
             format_bytes(speed as u64)
         );
+        let span = ratatui::text::Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
         let gauge = Gauge::default()
             .block(
                 Block::default()
@@ -227,7 +249,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             )
             .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
             .percent(percent)
-            .label(label);
+            .label(span);
         f.render_widget(gauge, bottom_chunks[0]);
     } else if let Some((up, total, speed)) = app.upload_progress {
         let percent = if total > 0 {
@@ -241,11 +263,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
             format_bytes(total),
             format_bytes(speed as u64)
         );
+        let span = ratatui::text::Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
         let gauge = Gauge::default()
             .block(Block::default().borders(Borders::ALL).title(" Uploading "))
             .gauge_style(Style::default().fg(Color::Blue).bg(Color::DarkGray))
             .percent(percent)
-            .label(label);
+            .label(span);
         f.render_widget(gauge, bottom_chunks[0]);
     } else if app.search_mode {
         let search_block = Paragraph::new(format!("/{}", app.search_query))
@@ -268,11 +296,17 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
         let label = format!("{} / {}", format_bytes(used), format_bytes(limit));
 
+        let span = ratatui::text::Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
         let gauge = Gauge::default()
             .block(Block::default().borders(Borders::ALL).title(" Storage "))
             .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
             .percent(percent)
-            .label(label);
+            .label(span);
         f.render_widget(gauge, bottom_chunks[1]);
     } else {
         let empty_block = Paragraph::new("Loading...")

@@ -85,99 +85,6 @@ pub async fn trash_file(
 }
 
 /// Downloads a file from Google Drive to the user's Downloads folder
-pub async fn download_file(
-    client: Client,
-    access_token: String,
-    file: DriveFile,
-    tx: mpsc::Sender<Event>,
-) {
-    let url = format!(
-        "https://www.googleapis.com/drive/v3/files/{}?alt=media",
-        file.id
-    );
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let dest_path = format!("{}/Downloads/{}", home, file.name);
-
-    match client.get(&url).bearer_auth(&access_token).send().await {
-        Ok(res) if res.status().is_success() => {
-            let total_size = res.content_length().unwrap_or(0);
-            let mut downloaded = 0;
-
-            if let Ok(mut file_out) = tokio::fs::File::create(&dest_path).await {
-                use futures_util::StreamExt;
-                let mut stream = res.bytes_stream();
-                let start_time = std::time::Instant::now();
-                let mut last_update = std::time::Instant::now();
-
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(chunk) => {
-                            if tokio::io::AsyncWriteExt::write_all(&mut file_out, &chunk)
-                                .await
-                                .is_err()
-                            {
-                                let _ = tx
-                                    .send(Event::Action(Action::Error(
-                                        "Failed to write to file".into(),
-                                    )))
-                                    .await;
-                                return;
-                            }
-                            downloaded += chunk.len() as u64;
-
-                            let now = std::time::Instant::now();
-                            if now.duration_since(last_update).as_millis() > 100 {
-                                let elapsed = now.duration_since(start_time).as_secs_f64();
-                                let speed = if elapsed > 0.0 {
-                                    downloaded as f64 / elapsed
-                                } else {
-                                    0.0
-                                };
-                                let _ = tx
-                                    .send(Event::Action(Action::DownloadProgress(
-                                        downloaded, total_size, speed,
-                                    )))
-                                    .await;
-                                last_update = now;
-                            }
-                        }
-                        Err(_) => {
-                            let _ = tx
-                                .send(Event::Action(Action::Error("Download stream error".into())))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-                let _ = tx
-                    .send(Event::Action(Action::DownloadComplete(format!(
-                        "Saved to {}",
-                        dest_path
-                    ))))
-                    .await;
-            } else {
-                let _ = tx
-                    .send(Event::Action(Action::Error(
-                        "Could not create local file".into(),
-                    )))
-                    .await;
-            }
-        }
-        Ok(res) => {
-            let _ = tx
-                .send(Event::Action(Action::Error(format!(
-                    "Download failed: {}",
-                    res.status()
-                ))))
-                .await;
-        }
-        Err(e) => {
-            let _ = tx.send(Event::Action(Action::Error(e.to_string()))).await;
-        }
-    }
-}
-
-/// Fetches storage quota from Google Drive API
 pub async fn fetch_quota(client: Client, access_token: String, tx: mpsc::Sender<Event>) {
     let url = "https://www.googleapis.com/drive/v3/about?fields=storageQuota";
     match client.get(url).bearer_auth(&access_token).send().await {
@@ -312,97 +219,6 @@ async fn resolve_or_create_path(
     Ok(current_id)
 }
 
-pub async fn upload_single_file_logic(
-    client: Client,
-    access_token: String,
-    parent_id: String,
-    local_path: String,
-    file_name: String,
-    tx: mpsc::Sender<Event>,
-) -> anyhow::Result<()> {
-    let file = tokio::fs::File::open(&local_path).await?;
-    let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-
-    let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
-    let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
-
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        use tokio_util::codec::{BytesCodec, FramedRead};
-        let mut framed = FramedRead::new(file, BytesCodec::new());
-        let mut uploaded = 0;
-        let start_time = std::time::Instant::now();
-        let mut last_update = std::time::Instant::now();
-
-        while let Some(chunk_res) = futures_util::StreamExt::next(&mut framed).await {
-            match chunk_res {
-                Ok(bytes) => {
-                    let len = bytes.len() as u64;
-                    if body_tx
-                        .send(Ok::<_, std::io::Error>(bytes.freeze()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    uploaded += len;
-
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_update).as_millis() > 100 {
-                        let elapsed = now.duration_since(start_time).as_secs_f64();
-                        let speed = if elapsed > 0.0 {
-                            uploaded as f64 / elapsed
-                        } else {
-                            0.0
-                        };
-                        let _ = tx_clone
-                            .send(Event::Action(Action::UploadProgress(
-                                uploaded, total_size, speed,
-                            )))
-                            .await;
-                        last_update = now;
-                    }
-                }
-                Err(e) => {
-                    let _ = tx_clone
-                        .send(Event::Action(Action::Error(format!("Read err: {}", e))))
-                        .await;
-                    break;
-                }
-            }
-        }
-    });
-
-    let metadata = serde_json::json!({
-        "name": file_name,
-        "parents": [parent_id]
-    });
-
-    let part_metadata = reqwest::multipart::Part::text(metadata.to_string())
-        .mime_str("application/json")
-        .unwrap();
-
-    let part_file = reqwest::multipart::Part::stream(reqwest::Body::wrap_stream(stream));
-
-    let form = reqwest::multipart::Form::new()
-        .part("metadata", part_metadata)
-        .part("file", part_file);
-
-    let url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-    let res = client
-        .post(url)
-        .bearer_auth(&access_token)
-        .multipart(form)
-        .send()
-        .await?;
-
-    if res.status().is_success() {
-        Ok(())
-    } else {
-        anyhow::bail!("Upload failed: {}", res.text().await.unwrap_or_default())
-    }
-}
-
 pub async fn upload_file(
     client: Client,
     access_token: String,
@@ -433,7 +249,7 @@ pub async fn upload_file(
 
     if metadata.is_dir() {
         let mut queue = vec![(std::path::PathBuf::from(&local_path), parent_id)];
-        let mut count = 0;
+        let _count = 0;
 
         while let Some((current_dir, current_parent_id)) = queue.pop() {
             let mut entries = match tokio::fs::read_dir(&current_dir).await {
@@ -507,28 +323,24 @@ pub async fn upload_file(
                     };
                     queue.push((path, next_parent_id));
                 } else {
-                    count += 1;
-                    let _ = tx
-                        .send(Event::Action(Action::UploadComplete(format!(
-                            "Uploading {} (file {})",
-                            name, count
-                        ))))
-                        .await;
-                    let _ = upload_single_file_logic(
-                        client.clone(),
-                        access_token.clone(),
-                        current_parent_id.clone(),
-                        path.to_string_lossy().to_string(),
+                    let total_bytes = entry_meta.len();
+                    let task = crate::app::UploadTask {
+                        local_path: path.to_string_lossy().to_string(),
                         name,
-                        tx.clone(),
-                    )
-                    .await;
+                        target_parent_id: current_parent_id.clone(),
+                        total_bytes,
+                        uploaded_bytes: 0,
+                        status: crate::app::UploadStatus::Pending,
+                    };
+                    let _ = tx
+                        .send(Event::Action(Action::QueueUploads(vec![task])))
+                        .await;
                 }
             }
         }
         let _ = tx
             .send(Event::Action(Action::UploadComplete(
-                "Directory upload complete".into(),
+                "Directory processed. Uploads queued.".into(),
             )))
             .await;
     } else {
@@ -537,28 +349,17 @@ pub async fn upload_file(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        match upload_single_file_logic(
-            client.clone(),
-            access_token.clone(),
-            parent_id,
+        let total_bytes = metadata.len();
+        let task = crate::app::UploadTask {
             local_path,
-            file_name,
-            tx.clone(),
-        )
-        .await
-        {
-            Ok(_) => {
-                let _ = tx
-                    .send(Event::Action(Action::UploadComplete(
-                        "Upload successful".into(),
-                    )))
-                    .await;
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(Event::Action(Action::Error(format!("Upload fail: {}", e))))
-                    .await;
-            }
-        }
+            name: file_name,
+            target_parent_id: parent_id,
+            total_bytes,
+            uploaded_bytes: 0,
+            status: crate::app::UploadStatus::Pending,
+        };
+        let _ = tx
+            .send(Event::Action(Action::QueueUploads(vec![task])))
+            .await;
     }
 }
