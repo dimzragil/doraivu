@@ -53,16 +53,17 @@ fn centered_rect(
 
 /// Renders the trash file list
 pub fn render_trash_block(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme_color = app.theme_color;
     let items: Vec<ListItem> = app
         .trashed_files
         .iter()
         .map(|file| {
-            let icon = if file.mime_type == "application/vnd.google-apps.folder" {
-                "📁"
-            } else {
-                "📄"
-            };
-            ListItem::new(Line::from(format!("{} {}", icon, file.name)))
+            let (icon, style) =
+                crate::tui::icons::get_file_meta(&file.name, &file.mime_type, theme_color);
+            ListItem::new(Line::from(vec![
+                Span::styled(icon, style),
+                Span::styled(&file.name, style),
+            ]))
         })
         .collect();
 
@@ -141,7 +142,7 @@ pub fn render_dl_tracker(f: &mut Frame, area: Rect, app: &mut App) {
                     Line::from(" [Esc] Close   [x] Cancel   [p] Pause   [r] Resume ")
                         .alignment(ratatui::layout::Alignment::Center),
                 )
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(app.theme_color)),
         )
         .highlight_style(
             Style::default()
@@ -175,7 +176,7 @@ pub fn render_dl_tracker(f: &mut Frame, area: Rect, app: &mut App) {
             Block::default()
                 .title(format!(" Bandwidth (Max: {:.1} MB/s) ", max_y))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(app.theme_color)),
         )
         .x_axis(
             ratatui::widgets::Axis::default()
@@ -245,7 +246,7 @@ pub fn render_ul_tracker(f: &mut Frame, area: Rect, app: &mut App) {
                     Line::from(" [Esc] Close   [x] Cancel   [p] Pause   [r] Resume ")
                         .alignment(ratatui::layout::Alignment::Center),
                 )
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(app.theme_color)),
         )
         .highlight_style(
             Style::default()
@@ -279,7 +280,7 @@ pub fn render_ul_tracker(f: &mut Frame, area: Rect, app: &mut App) {
             Block::default()
                 .title(format!(" Bandwidth (Max: {:.1} MB/s) ", max_y))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(app.theme_color)),
         )
         .x_axis(
             ratatui::widgets::Axis::default()
@@ -314,35 +315,34 @@ pub fn render(f: &mut Frame, app: &mut App) {
         format!("/{}", app.path_names[1..].join("/"))
     };
 
-    let top_block = Paragraph::new(format!(" Path: {} ", path_str))
-        .block(Block::default().borders(Borders::ALL).title(" doraivu "));
+    let top_block = Paragraph::new(format!(" Path: {} ", path_str)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" doraivu ")
+            .border_style(Style::default().fg(app.theme_color)),
+    );
     f.render_widget(top_block, chunks[0]);
 
     // Main list
+    let theme_color = app.theme_color;
     let items: Vec<ListItem> = app
         .files
         .iter()
         .map(|file| {
-            let icon = if file.mime_type == "application/vnd.google-apps.folder" {
-                "📁"
-            } else {
-                "📄"
-            };
+            let (icon, style) =
+                crate::tui::icons::get_file_meta(&file.name, &file.mime_type, theme_color);
 
             let mut line_spans = vec![];
             if app.selected_files.contains(&file.id) {
                 line_spans.push(Span::styled(
                     " ● ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme_color)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            line_spans.push(Span::raw(format!("{} ", icon)));
-            line_spans.push(Span::styled(
-                &file.name,
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
+            line_spans.push(Span::styled(icon, style));
+            line_spans.push(Span::styled(&file.name, style.add_modifier(Modifier::BOLD)));
 
             let content = Line::from(line_spans);
             ListItem::new(content)
@@ -350,7 +350,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Files "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Files ")
+                .border_style(Style::default().fg(app.theme_color)),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -442,7 +447,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
                 f.render_stateful_widget(list, center_chunks[0], &mut app.state);
 
-                let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
+                let preview_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Preview ")
+                    .border_style(Style::default().fg(app.theme_color));
                 let inner_area = preview_block.inner(center_chunks[1]);
                 f.render_widget(preview_block, center_chunks[1]);
 
@@ -461,7 +469,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .split(chunks[1]);
                 f.render_stateful_widget(list, center_chunks[0], &mut app.state);
 
-                let preview_block = Block::default().borders(Borders::ALL).title(" Metadata ");
+                let preview_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Metadata ")
+                    .border_style(Style::default().fg(app.theme_color));
                 let text = vec![
                     Line::from(vec![
                         Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -495,7 +506,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
                     .split(chunks[1]);
                 f.render_stateful_widget(list, center_chunks[0], &mut app.state);
-                let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
+                let preview_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Preview ")
+                    .border_style(Style::default().fg(app.theme_color));
                 f.render_widget(
                     Paragraph::new("Loading preview...").block(preview_block),
                     center_chunks[1],
@@ -507,7 +521,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
                     .split(chunks[1]);
                 f.render_stateful_widget(list, center_chunks[0], &mut app.state);
-                let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
+                let preview_block = Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Preview ")
+                    .border_style(Style::default().fg(app.theme_color));
                 f.render_widget(
                     Paragraph::new("No preview available.").block(preview_block),
                     center_chunks[1],
@@ -547,7 +564,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Downloading "),
+                    .title(" Downloading ")
+                    .border_style(Style::default().fg(app.theme_color)),
             )
             .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
             .percent(percent)
@@ -572,19 +590,33 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         );
         let gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" Uploading "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Uploading ")
+                    .border_style(Style::default().fg(app.theme_color)),
+            )
             .gauge_style(Style::default().fg(Color::Blue).bg(Color::DarkGray))
             .percent(percent)
             .label(span);
         f.render_widget(gauge, bottom_chunks[0]);
     } else if app.search_mode {
         let search_block = Paragraph::new(format!("/{}", app.search_query))
-            .block(Block::default().borders(Borders::ALL).title(" Search "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Search ")
+                    .border_style(Style::default().fg(app.theme_color)),
+            )
             .style(Style::default().fg(Color::Yellow));
         f.render_widget(search_block, bottom_chunks[0]);
     } else {
-        let status_block = Paragraph::new(app.status.clone())
-            .block(Block::default().borders(Borders::ALL).title(" Status "));
+        let status_block = Paragraph::new(app.status.clone()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Status ")
+                .border_style(Style::default().fg(app.theme_color)),
+        );
         f.render_widget(status_block, bottom_chunks[0]);
     }
 
@@ -605,14 +637,23 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         );
         let gauge = Gauge::default()
-            .block(Block::default().borders(Borders::ALL).title(" Storage "))
-            .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Storage ")
+                    .border_style(Style::default().fg(app.theme_color)),
+            )
+            .gauge_style(Style::default().fg(app.theme_color).bg(Color::DarkGray))
             .percent(percent)
             .label(span);
         f.render_widget(gauge, bottom_chunks[1]);
     } else {
-        let empty_block = Paragraph::new("Loading...")
-            .block(Block::default().borders(Borders::ALL).title(" Storage "));
+        let empty_block = Paragraph::new("Loading...").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Storage ")
+                .border_style(Style::default().fg(app.theme_color)),
+        );
         f.render_widget(empty_block, bottom_chunks[1]);
     }
 
@@ -673,7 +714,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .title(" Upload File ")
             .title_bottom(Line::from(" [Tab] Switch ").alignment(Alignment::Left))
             .title_bottom(Line::from(" [Enter] Upload ").alignment(Alignment::Right))
-            .borders(Borders::ALL);
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme_color));
         f.render_widget(block, area);
 
         let modal_chunks = Layout::default()
@@ -697,7 +739,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Target Path "),
+                    .title(" Target Path ")
+                    .border_style(if app.upload_input_idx == 0 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(app.theme_color)
+                    }),
             )
             .style(target_style);
 
@@ -705,7 +752,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Local File Path "),
+                    .title(" Local File Path ")
+                    .border_style(if app.upload_input_idx == 1 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(app.theme_color)
+                    }),
             )
             .style(local_style);
 

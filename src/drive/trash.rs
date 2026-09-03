@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 
 pub async fn fetch_trash(client: Client, access_token: String, tx: mpsc::Sender<Event>) {
     let url =
-        "https://www.googleapis.com/drive/v3/files?q=trashed=true&pageSize=1000&fields=files(id,name,mimeType)";
+        "https://www.googleapis.com/drive/v3/files?q=trashed=true&pageSize=1000&fields=files(id,name,mimeType,appProperties)";
     match client.get(url).bearer_auth(&access_token).send().await {
         Ok(res) if res.status().is_success() => {
             #[derive(serde::Deserialize)]

@@ -13,13 +13,20 @@ use drive::auth::{self, authenticate, AuthInfo};
 use drive::models::DriveFile;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use reqwest::Client;
-use std::{env, io, time::Duration};
+use std::{
+    env, io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use tui::actions::handle_action;
 use tui::events::handle_input;
 use tui::layout;
 use tui::preview::handle_suspend_and_edit;
-use tui::state::{App, Event};
+use tui::state::{Action, App, Event};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -106,18 +113,7 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::channel(32);
 
     // Initialize Virtual Root
-    app.files = vec![
-        DriveFile {
-            id: "root".to_string(),
-            name: "My Drive".to_string(),
-            mime_type: "application/vnd.google-apps.folder".to_string(),
-        },
-        DriveFile {
-            id: "shared_with_me".to_string(),
-            name: "Shared with me".to_string(),
-            mime_type: "application/vnd.google-apps.folder".to_string(),
-        },
-    ];
+    app.files = DriveFile::virtual_root_items();
     app.status = "Virtual Root loaded.".to_string();
 
     let client_quota = client.clone();
@@ -127,12 +123,23 @@ async fn main() -> Result<()> {
         fetch_quota(client_quota, token_quota, tx_quota).await;
     });
 
+    let is_editing = Arc::new(AtomicBool::new(false));
+
     // Input thread
     let tx_input = tx.clone();
+    let is_editing_input = is_editing.clone();
     tokio::spawn(async move {
         let mut last_tick = std::time::Instant::now();
         loop {
+            if is_editing_input.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             if event::poll(Duration::from_millis(250)).unwrap_or(false) {
+                if is_editing_input.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
                 match event::read() {
                     Ok(CEvent::Key(key)) => {
                         if tx_input.send(Event::Input(key)).await.is_err() {
@@ -148,7 +155,9 @@ async fn main() -> Result<()> {
                 }
             }
             if last_tick.elapsed().as_secs() >= 5 {
-                if tx_input.send(Event::Tick).await.is_err() {
+                if !is_editing_input.load(Ordering::SeqCst)
+                    && tx_input.send(Event::Tick).await.is_err()
+                {
                     break;
                 }
                 last_tick = std::time::Instant::now();
@@ -164,6 +173,28 @@ async fn main() -> Result<()> {
             match event {
                 Event::Tick => {
                     app.save_queues();
+                    // Proactive background token refresh before expiry (every 50 minutes / 3000 seconds)
+                    if app.token_refreshed_at.elapsed().as_secs() >= 3000
+                        && !app.is_refreshing_token
+                    {
+                        app.is_refreshing_token = true;
+                        let client_c = client.clone();
+                        let mut token_c = token.clone();
+                        let auth_info_c = auth_info.clone();
+                        let tx_c = tx.clone();
+                        tokio::spawn(async move {
+                            if auth::refresh_token_if_needed(&client_c, &auth_info_c, &mut token_c)
+                                .await
+                                .is_ok()
+                            {
+                                let _ = tx_c
+                                    .send(Event::Action(Action::TokenRefreshed(token_c)))
+                                    .await;
+                            } else {
+                                let _ = tx_c.send(Event::Action(Action::TokenRefreshFailed)).await;
+                            }
+                        });
+                    }
                 }
                 Event::Resize(_w, _h) => {
                     let _ = terminal.clear();
@@ -175,11 +206,23 @@ async fn main() -> Result<()> {
                     handle_action(&mut app, action, &client, &mut token, &auth_info, &tx);
                 }
                 Event::SuspendAndEdit(file) => {
-                    if let Err(e) =
-                        handle_suspend_and_edit(&mut app, file, &client, &token, &mut terminal)
-                            .await
+                    if let Err(e) = handle_suspend_and_edit(
+                        &mut app,
+                        file,
+                        &client,
+                        &token,
+                        &mut terminal,
+                        is_editing.clone(),
+                    )
+                    .await
                     {
                         app.status = format!("Edit error: {}", e);
+                    }
+                    // Drain any stale events captured during edit transition
+                    while let Ok(ev) = rx.try_recv() {
+                        if let Event::Action(action) = ev {
+                            handle_action(&mut app, action, &client, &mut token, &auth_info, &tx);
+                        }
                     }
                 }
             }

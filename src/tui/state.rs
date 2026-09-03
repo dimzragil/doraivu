@@ -30,12 +30,14 @@ pub enum Action {
     PreviewMetadataLoaded(String, Option<u64>, String, String),
     QueueUploads(Vec<UploadTask>),
     TokenRefreshed(crate::drive::auth::Token),
+    TokenRefreshFailed,
     UpdateUploadProgress(String, u64, u64, f64), // local_path, uploaded, total, speed
     CompleteUpload(String),                      // local_path
 
     QueueDownloads(Vec<DriveFile>),
     UpdateDownloadProgress(String, u64, u64, f64), // id, downloaded, total, speed
     CompleteDownload(String),                      // id
+    UpdateResumeTime(String, String),              // (id, resume_time)
 }
 
 #[derive(PartialEq)]
@@ -96,6 +98,9 @@ pub struct App {
     pub upload_local_path: String,
     pub upload_input_idx: usize,
     pub upload_progress: Option<(u64, u64, f64)>,
+    pub theme_color: ratatui::style::Color,
+    pub token_refreshed_at: std::time::Instant,
+    pub is_refreshing_token: bool,
 }
 
 impl Default for App {
@@ -187,6 +192,9 @@ impl App {
             upload_local_path: String::new(),
             upload_input_idx: 1,
             upload_progress: None,
+            theme_color: ratatui::style::Color::Cyan,
+            token_refreshed_at: std::time::Instant::now(),
+            is_refreshing_token: false,
         }
     }
 

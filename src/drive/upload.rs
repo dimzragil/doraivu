@@ -25,14 +25,16 @@ pub async fn upload_file_task(
 
     let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-    let (body_tx, body_rx) = tokio::sync::mpsc::channel(1);
+    // Buffer up to 32 chunks (approx 2MB) to prevent TCP starvation and cwnd collapse
+    let (body_tx, body_rx) = tokio::sync::mpsc::channel(32);
     let stream = tokio_stream::wrappers::ReceiverStream::new(body_rx);
 
     let tx_clone = tx.clone();
     let id_clone = local_path.clone();
 
     tokio::spawn(async move {
-        let mut framed = FramedRead::new(file, BytesCodec::new());
+        // Read in 64 KB chunks to efficiently feed TCP socket send buffers
+        let mut framed = FramedRead::with_capacity(file, BytesCodec::new(), 64 * 1024);
         let mut uploaded = 0;
         let mut last_uploaded = 0u64;
         let mut last_update = std::time::Instant::now();
@@ -52,7 +54,7 @@ pub async fn upload_file_task(
 
                     let now = std::time::Instant::now();
                     let elapsed = now.duration_since(last_update).as_secs_f64();
-                    if elapsed >= 0.1 {
+                    if elapsed >= 0.2 {
                         let speed = if elapsed > 0.0 {
                             (uploaded - last_uploaded) as f64 / elapsed
                         } else {

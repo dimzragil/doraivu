@@ -11,7 +11,7 @@ pub async fn fetch_files(
     tx: mpsc::Sender<Event>,
 ) {
     let url = format!(
-        "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id,name,mimeType)",
+        "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id,name,mimeType,appProperties)",
         urlencoding::encode(&query)
     );
 
@@ -137,7 +137,69 @@ pub async fn fetch_preview(
     }
 }
 
-/// Resolves a path like "/folder/subfolder" into a Google Drive folder ID,
+#[derive(Debug, PartialEq, Eq)]
+pub enum DriveBaseFolder {
+    Root,
+    SharedWithMe(String),
+    DirectId(String),
+}
+
+/// Parses a user-supplied target path string into a base Drive location and remaining subfolders.
+/// Handles virtual root, "/My Drive", "/Shared with me", direct IDs, and relative/absolute paths.
+pub fn parse_drive_path(path: &str) -> (DriveBaseFolder, Vec<String>) {
+    let trimmed = path.trim();
+
+    if trimmed.is_empty()
+        || trimmed == "/"
+        || trimmed == "root"
+        || trimmed == "virtual_root"
+        || trimmed == "/My Drive"
+        || trimmed == "My Drive"
+    {
+        return (DriveBaseFolder::Root, Vec::new());
+    }
+
+    // If it doesn't contain '/' and doesn't start with '/', it is a direct Google Drive folder ID
+    if !trimmed.starts_with('/') && !trimmed.contains('/') {
+        return (DriveBaseFolder::DirectId(trimmed.to_string()), Vec::new());
+    }
+
+    let parts: Vec<&str> = trimmed
+        .trim_matches('/')
+        .split('/')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if parts.is_empty() {
+        return (DriveBaseFolder::Root, Vec::new());
+    }
+
+    if parts[0].eq_ignore_ascii_case("My Drive") {
+        (
+            DriveBaseFolder::Root,
+            parts[1..].iter().map(|s| s.to_string()).collect(),
+        )
+    } else if parts[0].eq_ignore_ascii_case("Shared with me")
+        || parts[0].eq_ignore_ascii_case("shared_with_me")
+    {
+        if parts.len() < 2 {
+            (DriveBaseFolder::SharedWithMe(String::new()), Vec::new())
+        } else {
+            (
+                DriveBaseFolder::SharedWithMe(parts[1].to_string()),
+                parts[2..].iter().map(|s| s.to_string()).collect(),
+            )
+        }
+    } else {
+        (
+            DriveBaseFolder::Root,
+            parts.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+}
+
+/// Resolves a path like "/My Drive/folder/subfolder" into a Google Drive folder ID,
 /// creating folders along the way if they don't exist.
 async fn resolve_or_create_path(
     client: &Client,
@@ -145,18 +207,58 @@ async fn resolve_or_create_path(
     path: &str,
     tx: &mpsc::Sender<Event>,
 ) -> anyhow::Result<String> {
-    if !path.starts_with('/') {
-        return Ok(path.to_string());
-    }
+    let (base, remaining) = parse_drive_path(path);
 
-    let mut current_id = "root".to_string();
-    let parts: Vec<&str> = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut current_id = match base {
+        DriveBaseFolder::DirectId(id) => return Ok(id),
+        DriveBaseFolder::Root => "root".to_string(),
+        DriveBaseFolder::SharedWithMe(shared_folder) => {
+            if shared_folder.is_empty() {
+                anyhow::bail!(
+                    "Cannot upload directly to 'Shared with me' root. Please specify a shared folder name (e.g. /Shared with me/FolderName)"
+                );
+            }
+            let _ = tx
+                .send(Event::Action(Action::UploadComplete(format!(
+                    "Resolving shared folder {}...",
+                    shared_folder
+                ))))
+                .await;
 
-    for part in parts {
+            let query = format!(
+                "mimeType = 'application/vnd.google-apps.folder' and name = '{}' and sharedWithMe = true and trashed = false",
+                shared_folder.replace('\'', "\\'")
+            );
+            let url = format!(
+                "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id)",
+                urlencoding::encode(&query)
+            );
+
+            let res = client.get(&url).bearer_auth(access_token).send().await?;
+            if !res.status().is_success() {
+                anyhow::bail!("Failed to query shared folder '{}'", shared_folder);
+            }
+
+            let data: serde_json::Value = res.json().await?;
+            let found_id = data["files"]
+                .as_array()
+                .and_then(|files| files.first())
+                .and_then(|f| f["id"].as_str())
+                .map(|id| id.to_string());
+
+            match found_id {
+                Some(id) => id,
+                None => {
+                    anyhow::bail!(
+                        "Shared folder '{}' not found in 'Shared with me'",
+                        shared_folder
+                    );
+                }
+            }
+        }
+    };
+
+    for part in remaining {
         let _ = tx
             .send(Event::Action(Action::UploadComplete(format!(
                 "Resolving {}...",
@@ -164,7 +266,11 @@ async fn resolve_or_create_path(
             ))))
             .await;
 
-        let query = format!("mimeType = 'application/vnd.google-apps.folder' and name = '{}' and '{}' in parents and trashed = false", part, current_id);
+        let query = format!(
+            "mimeType = 'application/vnd.google-apps.folder' and name = '{}' and '{}' in parents and trashed = false",
+            part.replace('\'', "\\'"),
+            current_id
+        );
         let url = format!(
             "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id)",
             urlencoding::encode(&query)
@@ -172,7 +278,7 @@ async fn resolve_or_create_path(
 
         let res = client.get(&url).bearer_auth(access_token).send().await?;
         if !res.status().is_success() {
-            anyhow::bail!("API err {}", part);
+            anyhow::bail!("API error resolving folder '{}'", part);
         }
 
         let data: serde_json::Value = res.json().await?;
@@ -206,14 +312,14 @@ async fn resolve_or_create_path(
             .await?;
 
         if !res.status().is_success() {
-            anyhow::bail!("Fail create {}", part);
+            anyhow::bail!("Failed to create folder '{}'", part);
         }
 
         let data: serde_json::Value = res.json().await?;
         if let Some(id) = data["id"].as_str() {
             current_id = id.to_string();
         } else {
-            anyhow::bail!("No ID {}", part);
+            anyhow::bail!("No ID returned when creating folder '{}'", part);
         }
     }
 
@@ -372,7 +478,7 @@ pub async fn fetch_metadata(
     tx: mpsc::Sender<Event>,
 ) {
     let url = format!(
-        "https://www.googleapis.com/drive/v3/files/{}?fields=name,size,createdTime,modifiedTime",
+        "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,mimeType,size,createdTime,modifiedTime,appProperties",
         file_id
     );
     match client.get(&url).bearer_auth(&access_token).send().await {
@@ -401,6 +507,35 @@ pub async fn fetch_metadata(
     }
 }
 
+pub async fn update_resume_time(
+    client: Client,
+    access_token: String,
+    file_id: String,
+    resume_time: String,
+) -> anyhow::Result<()> {
+    let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
+    let payload = serde_json::json!({
+        "appProperties": {
+            "mpv_resume_time": resume_time
+        }
+    });
+
+    let res = client
+        .patch(&url)
+        .bearer_auth(&access_token)
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to update resume time: {} - {}", status, body);
+    }
+
+    Ok(())
+}
+
 pub fn format_time(rfc3339: &str) -> String {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339) {
         dt.with_timezone(&chrono::Local)
@@ -408,5 +543,80 @@ pub fn format_time(rfc3339: &str) -> String {
             .to_string()
     } else {
         rfc3339.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_drive_path_root_and_virtual_root() {
+        assert_eq!(parse_drive_path("/"), (DriveBaseFolder::Root, vec![]));
+        assert_eq!(parse_drive_path(""), (DriveBaseFolder::Root, vec![]));
+        assert_eq!(parse_drive_path("root"), (DriveBaseFolder::Root, vec![]));
+        assert_eq!(
+            parse_drive_path("virtual_root"),
+            (DriveBaseFolder::Root, vec![])
+        );
+        assert_eq!(
+            parse_drive_path("/My Drive"),
+            (DriveBaseFolder::Root, vec![])
+        );
+        assert_eq!(
+            parse_drive_path("My Drive"),
+            (DriveBaseFolder::Root, vec![])
+        );
+    }
+
+    #[test]
+    fn test_parse_drive_path_subfolders_under_my_drive() {
+        assert_eq!(
+            parse_drive_path("/My Drive/Photos"),
+            (DriveBaseFolder::Root, vec!["Photos".to_string()])
+        );
+        assert_eq!(
+            parse_drive_path("/My Drive/Photos/2026"),
+            (
+                DriveBaseFolder::Root,
+                vec!["Photos".to_string(), "2026".to_string()]
+            )
+        );
+        assert_eq!(
+            parse_drive_path("/Photos/2026"),
+            (
+                DriveBaseFolder::Root,
+                vec!["Photos".to_string(), "2026".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_drive_path_shared_with_me() {
+        assert_eq!(
+            parse_drive_path("/Shared with me/TeamProjects"),
+            (
+                DriveBaseFolder::SharedWithMe("TeamProjects".to_string()),
+                vec![]
+            )
+        );
+        assert_eq!(
+            parse_drive_path("/Shared with me/TeamProjects/Docs"),
+            (
+                DriveBaseFolder::SharedWithMe("TeamProjects".to_string()),
+                vec!["Docs".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_drive_path_direct_id() {
+        assert_eq!(
+            parse_drive_path("1aBcDeFg_12345"),
+            (
+                DriveBaseFolder::DirectId("1aBcDeFg_12345".to_string()),
+                vec![]
+            )
+        );
     }
 }

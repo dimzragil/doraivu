@@ -14,7 +14,70 @@ pub fn handle_action(
     match action {
         Action::TokenRefreshed(new_token) => {
             *token = new_token;
+            app.token_refreshed_at = std::time::Instant::now();
+            app.is_refreshing_token = false;
             app.status = "Token refreshed successfully!".to_string();
+
+            // 1. Resume active or pending download automatically
+            if app.active_dl_task.is_none() {
+                if let Some(target) = app
+                    .dl_manager
+                    .queue
+                    .iter_mut()
+                    .find(|t| t.status != models::DownloadStatus::Paused)
+                {
+                    target.status = models::DownloadStatus::Downloading;
+                    let c = client.clone();
+                    let t = token.access_token.clone();
+                    let txc = tx.clone();
+                    let f = target.file.clone();
+                    let start_bytes = target.downloaded_bytes;
+                    app.status = format!("Resuming download for {}...", f.name);
+                    app.active_dl_task = Some(tokio::spawn(async move {
+                        crate::drive::download::download_file_ranged(c, t, f, start_bytes, txc)
+                            .await;
+                    }));
+                }
+            }
+
+            // 2. Resume active or pending upload automatically
+            if app.active_ul_task.is_none() {
+                if let Some(target) = app
+                    .ul_manager
+                    .queue
+                    .iter_mut()
+                    .find(|t| t.status != models::UploadStatus::Paused)
+                {
+                    target.status = models::UploadStatus::Uploading;
+                    let task_clone = target.clone();
+                    let client_c = client.clone();
+                    let token_c = token.access_token.clone();
+                    let tx_c = tx.clone();
+                    app.status = format!("Resuming upload for {}...", target.name);
+                    app.active_ul_task = Some(tokio::spawn(async move {
+                        upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
+                    }));
+                }
+            }
+
+            // 3. Refresh file view if currently in a real folder
+            if app.current_path != "virtual_root" {
+                let c = client.clone();
+                let t = token.access_token.clone();
+                let txc = tx.clone();
+                let parent_id = app.current_path.clone();
+                tokio::spawn(async move {
+                    let q = if parent_id == "shared_with_me" {
+                        "sharedWithMe = true and trashed = false".to_string()
+                    } else {
+                        format!("'{}' in parents and trashed = false", parent_id)
+                    };
+                    crate::drive::api::fetch_files(c, t, q, txc).await;
+                });
+            }
+        }
+        Action::TokenRefreshFailed => {
+            app.is_refreshing_token = false;
         }
         Action::LoadFiles(files) => {
             app.files = files;
@@ -184,32 +247,61 @@ pub fn handle_action(
         }
         Action::Error(err) => {
             app.status = format!("Error: {}", err);
-            app.download_progress = None;
-            app.upload_progress = None;
-            if err.contains("401 Unauthorized") {
-                app.status = "Token expired! Refreshing automatically...".to_string();
-                let client_c = client.clone();
-                let mut token_c = token.clone();
-                let auth_info_c = auth_info.clone();
-                let tx_c = tx.clone();
-                tokio::spawn(async move {
-                    match auth::refresh_token_if_needed(&client_c, &auth_info_c, &mut token_c).await
-                    {
-                        Ok(_) => {
-                            let _ = tx_c
-                                .send(Event::Action(Action::TokenRefreshed(token_c)))
-                                .await;
+            let lower_err = err.to_lowercase();
+            if lower_err.contains("401")
+                || lower_err.contains("unauthorized")
+                || lower_err.contains("invalid credentials")
+                || lower_err.contains("unauthenticated")
+            {
+                app.download_progress = None;
+                app.upload_progress = None;
+                app.active_dl_task = None;
+                app.active_ul_task = None;
+
+                if !app.is_refreshing_token {
+                    app.is_refreshing_token = true;
+                    app.status =
+                        "Token expired! Refreshing token and resuming automatically...".to_string();
+                    let client_c = client.clone();
+                    let mut token_c = token.clone();
+                    let auth_info_c = auth_info.clone();
+                    let tx_c = tx.clone();
+                    tokio::spawn(async move {
+                        let mut retries = 0;
+                        loop {
+                            match auth::refresh_token_if_needed(
+                                &client_c,
+                                &auth_info_c,
+                                &mut token_c,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    let _ = tx_c
+                                        .send(Event::Action(Action::TokenRefreshed(token_c)))
+                                        .await;
+                                    break;
+                                }
+                                Err(e) => {
+                                    retries += 1;
+                                    if retries >= 5 {
+                                        let _ = tx_c
+                                            .send(Event::Action(Action::Error(format!(
+                                                "Token refresh failed after retries: {}",
+                                                e
+                                            ))))
+                                            .await;
+                                        let _ = tx_c
+                                            .send(Event::Action(Action::TokenRefreshFailed))
+                                            .await;
+                                        break;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                }
+                            }
                         }
-                        Err(e) => {
-                            let _ = tx_c
-                                .send(Event::Action(Action::Error(format!(
-                                    "Refresh failed: {}",
-                                    e
-                                ))))
-                                .await;
-                        }
-                    }
-                });
+                    });
+                }
             }
         }
 
@@ -238,6 +330,15 @@ pub fn handle_action(
                     modified,
                 };
             }
+        }
+        Action::UpdateResumeTime(id, time) => {
+            if let Some(f) = app.files.iter_mut().find(|f| f.id == id) {
+                let props = f
+                    .app_properties
+                    .get_or_insert_with(std::collections::HashMap::new);
+                props.insert("mpv_resume_time".to_string(), time.clone());
+            }
+            app.status = format!("Saved playback position ({}s).", time);
         }
     }
 }
