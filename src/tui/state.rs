@@ -1,16 +1,11 @@
+use crate::drive::models::{
+    DownloadManager, DownloadStatus, DownloadTask, DriveFile, UploadManager, UploadStatus,
+    UploadTask,
+};
 use ratatui::widgets::ListState;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
-/// Represents a file or folder from Google Drive
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DriveFile {
-    pub id: String,
-    pub name: String,
-    pub mime_type: String,
-}
-
-/// Represents background network actions that update the UI
+/// Preview state for the split-pane preview panel
 pub enum PreviewState {
     None,
     Loading,
@@ -23,6 +18,7 @@ pub enum PreviewState {
     },
 }
 
+/// Represents background network actions that update the UI
 pub enum Action {
     LoadFiles(Vec<DriveFile>),
     LoadTrash(Vec<DriveFile>),
@@ -33,7 +29,7 @@ pub enum Action {
     ImagePreview(Vec<u8>),
     PreviewMetadataLoaded(String, Option<u64>, String, String),
     QueueUploads(Vec<UploadTask>),
-    TokenRefreshed(crate::auth::Token),
+    TokenRefreshed(crate::drive::auth::Token),
     UpdateUploadProgress(String, u64, u64, f64), // local_path, uploaded, total, speed
     CompleteUpload(String),                      // local_path
 
@@ -64,71 +60,6 @@ pub enum Event {
     Tick,
 }
 
-#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
-pub enum UploadStatus {
-    Pending,
-    Uploading,
-    Paused,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct UploadTask {
-    pub local_path: String,
-    pub name: String,
-    pub target_parent_id: String,
-    pub total_bytes: u64,
-    pub uploaded_bytes: u64,
-    pub status: UploadStatus,
-}
-
-pub struct UploadManager {
-    pub queue: Vec<UploadTask>,
-    pub speed_history: VecDeque<u64>,
-    pub state: ratatui::widgets::ListState,
-}
-
-impl UploadManager {
-    pub fn new() -> Self {
-        Self {
-            queue: Vec::new(),
-            speed_history: VecDeque::from(vec![0; 100]),
-            state: ratatui::widgets::ListState::default(),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
-pub enum DownloadStatus {
-    Pending,
-    Downloading,
-    Paused,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DownloadTask {
-    pub file: DriveFile,
-    pub total_bytes: u64,
-    pub downloaded_bytes: u64,
-    pub status: DownloadStatus,
-}
-
-pub struct DownloadManager {
-    pub queue: Vec<DownloadTask>,
-    pub speed_history: VecDeque<u64>,
-    pub state: ratatui::widgets::ListState,
-}
-
-impl DownloadManager {
-    pub fn new() -> Self {
-        Self {
-            queue: Vec::new(),
-            speed_history: VecDeque::from(vec![0; 100]),
-            state: ratatui::widgets::ListState::default(),
-        }
-    }
-}
-
-/// Core application state
 #[derive(PartialEq, Clone, Copy)]
 pub enum PreviewMode {
     Hidden,
@@ -136,6 +67,7 @@ pub enum PreviewMode {
     ForceMetadata,
 }
 
+/// Core application state
 pub struct App {
     pub files: Vec<DriveFile>,
     pub dl_manager: DownloadManager,
@@ -162,7 +94,7 @@ pub struct App {
     pub input_mode: InputMode,
     pub upload_target_id: String,
     pub upload_local_path: String,
-    pub upload_input_idx: usize, // 0 = target, 1 = file path
+    pub upload_input_idx: usize,
     pub upload_progress: Option<(u64, u64, f64)>,
 }
 
@@ -174,7 +106,7 @@ impl Default for App {
 
 impl App {
     pub fn save_queues(&self) {
-        if let Ok(config_dir) = crate::auth::get_config_dir() {
+        if let Ok(config_dir) = crate::drive::auth::get_config_dir() {
             let path = config_dir.join("queues.json");
             if self.dl_manager.queue.is_empty() && self.ul_manager.queue.is_empty() {
                 let _ = std::fs::remove_file(&path);
@@ -196,7 +128,7 @@ impl App {
     }
 
     pub fn load_queues(&mut self) {
-        if let Ok(config_dir) = crate::auth::get_config_dir() {
+        if let Ok(config_dir) = crate::drive::auth::get_config_dir() {
             let path = config_dir.join("queues.json");
             if let Ok(json) = std::fs::read_to_string(path) {
                 #[derive(serde::Deserialize)]
@@ -253,7 +185,7 @@ impl App {
             input_mode: InputMode::Normal,
             upload_target_id: String::new(),
             upload_local_path: String::new(),
-            upload_input_idx: 1, // Default focus on file path
+            upload_input_idx: 1,
             upload_progress: None,
         }
     }

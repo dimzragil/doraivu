@@ -1,15 +1,9 @@
-use crate::api::{fetch_files, fetch_quota, upload_file};
-use crate::app::{self, Action, App, Event};
-use crate::trigger_preview;
-use crate::{api, auth, trash, upload};
-use crossterm::{
-    event::KeyCode,
-    execute,
-    terminal::{disable_raw_mode, LeaveAlternateScreen},
-};
-use ratatui::{backend::CrosstermBackend, Terminal};
+use crate::drive::{api::fetch_files, api::fetch_quota, api::upload_file};
+use crate::drive::{auth, models, trash, upload};
+use crate::tui::preview::trigger_preview;
+use crate::tui::state::{self, Action, App, Event};
+use crossterm::event::KeyCode;
 use reqwest::Client;
-use std::io::Stdout;
 use tokio::sync::mpsc;
 
 pub fn handle_input(
@@ -20,9 +14,9 @@ pub fn handle_input(
     tx: &mpsc::Sender<Event>,
 ) {
     match app.input_mode {
-        app::InputMode::TrashView => match key.code {
+        state::InputMode::TrashView => match key.code {
             KeyCode::Esc => {
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if !app.trashed_files.is_empty() {
@@ -63,15 +57,15 @@ pub fn handle_input(
             }
             KeyCode::Char('x') | KeyCode::Delete => {
                 if app.trash_state.selected().is_some() {
-                    app.input_mode = app::InputMode::TrashDeleteConfirmModal;
+                    app.input_mode = state::InputMode::TrashDeleteConfirmModal;
                 }
             }
             KeyCode::Char('X') if !app.trashed_files.is_empty() => {
-                app.input_mode = app::InputMode::TrashDeleteAllConfirmModal;
+                app.input_mode = state::InputMode::TrashDeleteAllConfirmModal;
             }
             _ => {}
         },
-        app::InputMode::TrashDeleteConfirmModal => match key.code {
+        state::InputMode::TrashDeleteConfirmModal => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 if let Some(i) = app.trash_state.selected() {
                     if let Some(file) = app.trashed_files.get(i).cloned() {
@@ -84,14 +78,14 @@ pub fn handle_input(
                         });
                     }
                 }
-                app.input_mode = app::InputMode::TrashView;
+                app.input_mode = state::InputMode::TrashView;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.input_mode = app::InputMode::TrashView;
+                app.input_mode = state::InputMode::TrashView;
             }
             _ => {}
         },
-        app::InputMode::TrashDeleteAllConfirmModal => match key.code {
+        state::InputMode::TrashDeleteAllConfirmModal => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 app.status = "Emptying trash...".into();
                 let c = client.clone();
@@ -101,16 +95,16 @@ pub fn handle_input(
                 tokio::spawn(async move {
                     trash::empty_trash(c, t, files, txc).await;
                 });
-                app.input_mode = app::InputMode::TrashView;
+                app.input_mode = state::InputMode::TrashView;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.input_mode = app::InputMode::TrashView;
+                app.input_mode = state::InputMode::TrashView;
             }
             _ => {}
         },
-        app::InputMode::DeleteConfirmModal => match key.code {
+        state::InputMode::DeleteConfirmModal => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let targets: Vec<crate::app::DriveFile> = if !app.selected_files.is_empty() {
+                let targets: Vec<models::DriveFile> = if !app.selected_files.is_empty() {
                     app.files
                         .iter()
                         .filter(|f| app.selected_files.contains(&f.id))
@@ -134,20 +128,21 @@ pub fn handle_input(
 
                 tokio::spawn(async move {
                     for file in targets {
-                        api::trash_file(c.clone(), t.clone(), file.id, txc.clone()).await;
+                        crate::drive::api::trash_file(c.clone(), t.clone(), file.id, txc.clone())
+                            .await;
                     }
                 });
 
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
             }
             _ => {}
         },
-        app::InputMode::DownloadConfirmModal => match key.code {
+        state::InputMode::DownloadConfirmModal => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let targets: Vec<crate::app::DriveFile> = if !app.selected_files.is_empty() {
+                let targets: Vec<models::DriveFile> = if !app.selected_files.is_empty() {
                     app.files
                         .iter()
                         .filter(|f| app.selected_files.contains(&f.id))
@@ -164,22 +159,20 @@ pub fn handle_input(
                 let txc = tx.clone();
                 tokio::spawn(async move {
                     let _ = txc
-                        .send(crate::app::Event::Action(
-                            crate::app::Action::QueueDownloads(targets),
-                        ))
+                        .send(Event::Action(Action::QueueDownloads(targets)))
                         .await;
                 });
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
             }
             _ => {}
         },
 
-        app::InputMode::UploadTrackerView => match key.code {
+        state::InputMode::UploadTrackerView => match key.code {
             KeyCode::Esc => {
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 let i = match app.ul_manager.state.selected() {
@@ -211,7 +204,7 @@ pub fn handle_input(
                 if let Some(i) = app.ul_manager.state.selected() {
                     if i < app.ul_manager.queue.len() {
                         let task = &app.ul_manager.queue[i];
-                        if task.status == crate::app::UploadStatus::Uploading {
+                        if task.status == models::UploadStatus::Uploading {
                             if let Some(handle) = app.active_ul_task.take() {
                                 handle.abort();
                             }
@@ -229,9 +222,9 @@ pub fn handle_input(
                             .ul_manager
                             .queue
                             .iter_mut()
-                            .find(|t| t.status == crate::app::UploadStatus::Pending)
+                            .find(|t| t.status == models::UploadStatus::Pending)
                         {
-                            first.status = crate::app::UploadStatus::Uploading;
+                            first.status = models::UploadStatus::Uploading;
                             let task_clone = first.clone();
                             let client_c = client.clone();
                             let token_c = token.access_token.clone();
@@ -246,9 +239,9 @@ pub fn handle_input(
             KeyCode::Char('p') => {
                 if let Some(i) = app.ul_manager.state.selected() {
                     if i < app.ul_manager.queue.len()
-                        && app.ul_manager.queue[i].status == crate::app::UploadStatus::Uploading
+                        && app.ul_manager.queue[i].status == models::UploadStatus::Uploading
                     {
-                        app.ul_manager.queue[i].status = crate::app::UploadStatus::Paused;
+                        app.ul_manager.queue[i].status = models::UploadStatus::Paused;
                         if let Some(handle) = app.active_ul_task.take() {
                             handle.abort();
                         }
@@ -257,9 +250,9 @@ pub fn handle_input(
                             .ul_manager
                             .queue
                             .iter_mut()
-                            .find(|t| t.status == crate::app::UploadStatus::Pending)
+                            .find(|t| t.status == models::UploadStatus::Pending)
                         {
-                            first.status = crate::app::UploadStatus::Uploading;
+                            first.status = models::UploadStatus::Uploading;
                             let task_clone = first.clone();
                             let client_c = client.clone();
                             let token_c = token.access_token.clone();
@@ -274,17 +267,17 @@ pub fn handle_input(
             KeyCode::Char('r') => {
                 if let Some(i) = app.ul_manager.state.selected() {
                     if i < app.ul_manager.queue.len()
-                        && app.ul_manager.queue[i].status == crate::app::UploadStatus::Paused
+                        && app.ul_manager.queue[i].status == models::UploadStatus::Paused
                     {
-                        app.ul_manager.queue[i].status = crate::app::UploadStatus::Pending;
+                        app.ul_manager.queue[i].status = models::UploadStatus::Pending;
                         if app.active_ul_task.is_none() {
                             if let Some(first) = app
                                 .ul_manager
                                 .queue
                                 .iter_mut()
-                                .find(|t| t.status == crate::app::UploadStatus::Pending)
+                                .find(|t| t.status == models::UploadStatus::Pending)
                             {
-                                first.status = crate::app::UploadStatus::Uploading;
+                                first.status = models::UploadStatus::Uploading;
                                 let task_clone = first.clone();
                                 let client_c = client.clone();
                                 let token_c = token.access_token.clone();
@@ -300,9 +293,9 @@ pub fn handle_input(
             }
             _ => {}
         },
-        app::InputMode::DownloadTrackerView => match key.code {
+        state::InputMode::DownloadTrackerView => match key.code {
             KeyCode::Esc => {
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if !app.dl_manager.queue.is_empty() {
@@ -332,7 +325,7 @@ pub fn handle_input(
                 if let Some(i) = app.dl_manager.state.selected() {
                     if i < app.dl_manager.queue.len() {
                         let item = &app.dl_manager.queue[i];
-                        if item.status == crate::app::DownloadStatus::Downloading {
+                        if item.status == models::DownloadStatus::Downloading {
                             if let Some(task) = app.active_dl_task.take() {
                                 task.abort();
                             }
@@ -345,16 +338,16 @@ pub fn handle_input(
                                 .dl_manager
                                 .queue
                                 .iter_mut()
-                                .find(|t| t.status != crate::app::DownloadStatus::Paused)
+                                .find(|t| t.status != models::DownloadStatus::Paused)
                             {
-                                first.status = crate::app::DownloadStatus::Downloading;
+                                first.status = models::DownloadStatus::Downloading;
                                 let c = client.clone();
                                 let t = token.access_token.clone();
                                 let txc = tx.clone();
                                 let f = first.file.clone();
                                 let start_bytes = first.downloaded_bytes;
                                 app.active_dl_task = Some(tokio::spawn(async move {
-                                    crate::download::download_file_ranged(
+                                    crate::drive::download::download_file_ranged(
                                         c,
                                         t,
                                         f,
@@ -371,8 +364,8 @@ pub fn handle_input(
             KeyCode::Char('p') => {
                 if let Some(i) = app.dl_manager.state.selected() {
                     if let Some(item) = app.dl_manager.queue.get_mut(i) {
-                        if item.status == crate::app::DownloadStatus::Downloading {
-                            item.status = crate::app::DownloadStatus::Paused;
+                        if item.status == models::DownloadStatus::Downloading {
+                            item.status = models::DownloadStatus::Paused;
                             if let Some(task) = app.active_dl_task.take() {
                                 task.abort();
                             }
@@ -383,16 +376,16 @@ pub fn handle_input(
                                 .dl_manager
                                 .queue
                                 .iter_mut()
-                                .find(|t| t.status == crate::app::DownloadStatus::Pending)
+                                .find(|t| t.status == models::DownloadStatus::Pending)
                             {
-                                first.status = crate::app::DownloadStatus::Downloading;
+                                first.status = models::DownloadStatus::Downloading;
                                 let c = client.clone();
                                 let t = token.access_token.clone();
                                 let txc = tx.clone();
                                 let f = first.file.clone();
                                 let start_bytes = first.downloaded_bytes;
                                 app.active_dl_task = Some(tokio::spawn(async move {
-                                    crate::download::download_file_ranged(
+                                    crate::drive::download::download_file_ranged(
                                         c,
                                         t,
                                         f,
@@ -409,19 +402,19 @@ pub fn handle_input(
             KeyCode::Char('r') => {
                 if let Some(i) = app.dl_manager.state.selected() {
                     if let Some(item) = app.dl_manager.queue.get_mut(i) {
-                        if item.status == crate::app::DownloadStatus::Paused {
-                            item.status = crate::app::DownloadStatus::Pending;
+                        if item.status == models::DownloadStatus::Paused {
+                            item.status = models::DownloadStatus::Pending;
                             app.status = "Download queued for resume.".into();
 
                             if app.active_dl_task.is_none() {
-                                item.status = crate::app::DownloadStatus::Downloading;
+                                item.status = models::DownloadStatus::Downloading;
                                 let c = client.clone();
                                 let t = token.access_token.clone();
                                 let txc = tx.clone();
                                 let f = item.file.clone();
                                 let start_bytes = item.downloaded_bytes;
                                 app.active_dl_task = Some(tokio::spawn(async move {
-                                    crate::download::download_file_ranged(
+                                    crate::drive::download::download_file_ranged(
                                         c,
                                         t,
                                         f,
@@ -437,9 +430,9 @@ pub fn handle_input(
             }
             _ => {}
         },
-        app::InputMode::UploadModal => match key.code {
+        state::InputMode::UploadModal => match key.code {
             KeyCode::Esc => {
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
             }
             KeyCode::Tab => {
                 app.upload_input_idx = (app.upload_input_idx + 1) % 2;
@@ -457,7 +450,7 @@ pub fn handle_input(
                 };
                 let path = app.upload_local_path.clone();
                 app.upload_progress = Some((0, 0, 0.0));
-                app.input_mode = app::InputMode::Normal;
+                app.input_mode = state::InputMode::Normal;
                 app.upload_local_path.clear();
                 let c = client.clone();
                 let t = token.access_token.clone();
@@ -482,7 +475,7 @@ pub fn handle_input(
             }
             _ => {}
         },
-        app::InputMode::Normal => {
+        state::InputMode::Normal => {
             if app.search_mode {
                 match key.code {
                     KeyCode::Esc => {
@@ -497,12 +490,12 @@ pub fn handle_input(
                         if sq.is_empty() {
                             if app.current_path == "virtual_root" {
                                 app.files = vec![
-                                    crate::app::DriveFile {
+                                    models::DriveFile {
                                         id: "root".to_string(),
                                         name: "My Drive".to_string(),
                                         mime_type: "application/vnd.google-apps.folder".to_string(),
                                     },
-                                    crate::app::DriveFile {
+                                    models::DriveFile {
                                         id: "shared_with_me".to_string(),
                                         name: "Shared with me".to_string(),
                                         mime_type: "application/vnd.google-apps.folder".to_string(),
@@ -563,28 +556,22 @@ pub fn handle_input(
                         if let Some(file) = app.selected_file() {
                             if file.mime_type.starts_with("image/") {
                                 app.preview_mode = match app.preview_mode {
-                                    crate::app::PreviewMode::Hidden => {
-                                        crate::app::PreviewMode::Default
+                                    state::PreviewMode::Hidden => state::PreviewMode::Default,
+                                    state::PreviewMode::Default => {
+                                        state::PreviewMode::ForceMetadata
                                     }
-                                    crate::app::PreviewMode::Default => {
-                                        crate::app::PreviewMode::ForceMetadata
-                                    }
-                                    crate::app::PreviewMode::ForceMetadata => {
-                                        crate::app::PreviewMode::Hidden
-                                    }
+                                    state::PreviewMode::ForceMetadata => state::PreviewMode::Hidden,
                                 };
                             } else {
                                 app.preview_mode = match app.preview_mode {
-                                    crate::app::PreviewMode::Hidden => {
-                                        crate::app::PreviewMode::Default
-                                    }
-                                    _ => crate::app::PreviewMode::Hidden,
+                                    state::PreviewMode::Hidden => state::PreviewMode::Default,
+                                    _ => state::PreviewMode::Hidden,
                                 };
                             }
                         } else {
                             app.preview_mode = match app.preview_mode {
-                                crate::app::PreviewMode::Hidden => crate::app::PreviewMode::Default,
-                                _ => crate::app::PreviewMode::Hidden,
+                                state::PreviewMode::Hidden => state::PreviewMode::Default,
+                                _ => state::PreviewMode::Hidden,
                             };
                         }
                         trigger_preview(app, client, &token.access_token, tx);
@@ -599,12 +586,12 @@ pub fn handle_input(
                         let parent_id = app.current_path.clone();
                         if parent_id == "virtual_root" {
                             app.files = vec![
-                                crate::app::DriveFile {
+                                models::DriveFile {
                                     id: "root".to_string(),
                                     name: "My Drive".to_string(),
                                     mime_type: "application/vnd.google-apps.folder".to_string(),
                                 },
-                                crate::app::DriveFile {
+                                models::DriveFile {
                                     id: "shared_with_me".to_string(),
                                     name: "Shared with me".to_string(),
                                     mime_type: "application/vnd.google-apps.folder".to_string(),
@@ -624,13 +611,13 @@ pub fn handle_input(
                         }
                     }
                     KeyCode::Char('T') => {
-                        app.input_mode = app::InputMode::TrashView;
+                        app.input_mode = state::InputMode::TrashView;
                         app.status = "Loading trash...".into();
                         let c = client.clone();
                         let t = token.access_token.clone();
                         let txc = tx.clone();
                         tokio::spawn(async move {
-                            crate::trash::fetch_trash(c, t, txc).await;
+                            trash::fetch_trash(c, t, txc).await;
                         });
                     }
                     KeyCode::Char('/') => {
@@ -667,7 +654,7 @@ pub fn handle_input(
                                 app.path_names.push(file.name.clone());
                                 app.current_path = file.id.clone();
                                 app.status = format!("Loading folder: {}...", file.name);
-                                app.files.clear(); // Optional: clear while loading
+                                app.files.clear();
 
                                 let c = client.clone();
                                 let t = token.access_token.clone();
@@ -697,12 +684,12 @@ pub fn handle_input(
 
                             if parent_id == "virtual_root" {
                                 app.files = vec![
-                                    crate::app::DriveFile {
+                                    models::DriveFile {
                                         id: "root".to_string(),
                                         name: "My Drive".to_string(),
                                         mime_type: "application/vnd.google-apps.folder".to_string(),
                                     },
-                                    crate::app::DriveFile {
+                                    models::DriveFile {
                                         id: "shared_with_me".to_string(),
                                         name: "Shared with me".to_string(),
                                         mime_type: "application/vnd.google-apps.folder".to_string(),
@@ -728,32 +715,32 @@ pub fn handle_input(
                     }
                     KeyCode::Char('x') | KeyCode::Delete => {
                         if app.selected_file().is_some() {
-                            app.input_mode = app::InputMode::DeleteConfirmModal;
+                            app.input_mode = state::InputMode::DeleteConfirmModal;
                         }
                     }
                     KeyCode::Char('d') => {
                         if let Some(file) = app.selected_file().cloned() {
                             if file.mime_type != "application/vnd.google-apps.folder" {
-                                app.input_mode = app::InputMode::DownloadConfirmModal;
+                                app.input_mode = state::InputMode::DownloadConfirmModal;
                             } else {
                                 app.status = "Cannot download folders directly yet.".into();
                             }
                         }
                     }
                     KeyCode::Char('D') => {
-                        app.input_mode = app::InputMode::DownloadTrackerView;
+                        app.input_mode = state::InputMode::DownloadTrackerView;
                     }
                     KeyCode::Char('U') => {
-                        app.input_mode = app::InputMode::UploadTrackerView;
+                        app.input_mode = state::InputMode::UploadTrackerView;
                     }
                     KeyCode::Char('u') => {
-                        app.input_mode = app::InputMode::UploadModal;
+                        app.input_mode = state::InputMode::UploadModal;
                         if app.path_names.len() == 1 {
                             app.upload_target_id = "/".to_string();
                         } else {
                             app.upload_target_id = format!("/{}", app.path_names[1..].join("/"));
                         }
-                        app.upload_input_idx = 1; // focus local path
+                        app.upload_input_idx = 1;
                         let home = directories::UserDirs::new()
                             .map(|u| u.home_dir().to_string_lossy().to_string())
                             .unwrap_or_else(|| "/".to_string());
@@ -791,324 +778,4 @@ pub fn handle_input(
             }
         }
     }
-}
-
-pub fn handle_action(
-    app: &mut App,
-    action: Action,
-    client: &Client,
-    token: &mut auth::Token,
-    auth_info: &auth::AuthInfo,
-    tx: &mpsc::Sender<Event>,
-) {
-    match action {
-        Action::TokenRefreshed(new_token) => {
-            *token = new_token;
-            app.status = "Token refreshed successfully!".to_string();
-        }
-        Action::LoadFiles(files) => {
-            app.files = files;
-            app.status = format!("Loaded {} items.", app.files.len());
-            app.state
-                .select(if app.files.is_empty() { None } else { Some(0) });
-        }
-        Action::LoadTrash(files) => {
-            app.trashed_files = files;
-            app.status = format!("Loaded {} trashed items.", app.trashed_files.len());
-            app.trash_state.select(if app.trashed_files.is_empty() {
-                None
-            } else {
-                Some(0)
-            });
-        }
-        Action::Message(msg) => {
-            app.status = msg;
-        }
-        Action::QueueDownloads(files) => {
-            for f in files {
-                app.dl_manager.queue.push(crate::app::DownloadTask {
-                    file: f,
-                    total_bytes: 0,
-                    downloaded_bytes: 0,
-                    status: crate::app::DownloadStatus::Pending,
-                });
-            }
-            // Start if none active
-            if app.active_dl_task.is_none() {
-                if let Some(first) = app.dl_manager.queue.first_mut() {
-                    first.status = crate::app::DownloadStatus::Downloading;
-                    let c = client.clone();
-                    let t = token.access_token.clone();
-                    let txc = tx.clone();
-                    let f = first.file.clone();
-                    app.active_dl_task = Some(tokio::spawn(async move {
-                        crate::download::download_file_ranged(c, t, f, 0, txc).await;
-                    }));
-                }
-            }
-        }
-        Action::UpdateDownloadProgress(id, dl, total, speed) => {
-            if let Some(task) = app.dl_manager.queue.iter_mut().find(|t| t.file.id == id) {
-                task.downloaded_bytes = dl;
-                task.total_bytes = total;
-            }
-            app.dl_manager.speed_history.push_back(speed as u64);
-            if app.dl_manager.speed_history.len() > 100 {
-                app.dl_manager.speed_history.pop_front();
-            }
-            // Keep legacy global progress updated
-            app.download_progress = Some((dl, total, speed));
-        }
-        Action::QueueUploads(tasks) => {
-            for t in tasks {
-                app.ul_manager.queue.push(t);
-            }
-            if app.active_ul_task.is_none() {
-                if let Some(first) = app
-                    .ul_manager
-                    .queue
-                    .iter_mut()
-                    .find(|t| t.status == crate::app::UploadStatus::Pending)
-                {
-                    first.status = crate::app::UploadStatus::Uploading;
-                    let task_clone = first.clone();
-                    let client_c = client.clone();
-                    let token_c = token.access_token.clone();
-                    let tx_c = tx.clone();
-                    app.active_ul_task = Some(tokio::spawn(async move {
-                        upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
-                    }));
-                }
-            }
-            app.status = format!("{} upload(s) queued.", app.ul_manager.queue.len());
-        }
-        Action::UpdateUploadProgress(id, downloaded, total, speed) => {
-            if let Some(task) = app.ul_manager.queue.iter_mut().find(|t| t.local_path == id) {
-                task.uploaded_bytes = downloaded;
-                task.total_bytes = total;
-            }
-            app.ul_manager.speed_history.push_back(speed as u64);
-            if app.ul_manager.speed_history.len() > 100 {
-                app.ul_manager.speed_history.pop_front();
-            }
-            app.upload_progress = Some((downloaded, total, speed));
-        }
-        Action::CompleteUpload(id) => {
-            app.ul_manager.queue.retain(|t| t.local_path != id);
-            app.active_ul_task = None;
-            app.upload_progress = None;
-
-            if let Some(first) = app
-                .ul_manager
-                .queue
-                .iter_mut()
-                .find(|t| t.status == crate::app::UploadStatus::Pending)
-            {
-                first.status = crate::app::UploadStatus::Uploading;
-                let task_clone = first.clone();
-                let client_c = client.clone();
-                let token_c = token.access_token.clone();
-                let tx_c = tx.clone();
-                app.active_ul_task = Some(tokio::spawn(async move {
-                    upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
-                }));
-            } else if !app.ul_manager.queue.is_empty()
-                && app
-                    .ul_manager
-                    .queue
-                    .iter()
-                    .all(|t| t.status == crate::app::UploadStatus::Paused)
-            {
-                app.status = "Uploads paused.".into();
-            } else if app.ul_manager.queue.is_empty() {
-                app.status = "All uploads complete.".into();
-
-                // Automatically fetch files after upload is done!
-                let txc = tx.clone();
-                let client_c = client.clone();
-                let token_c = token.access_token.clone();
-                let current = app.current_path.clone();
-                tokio::spawn(async move {
-                    if current != "virtual_root" {
-                        let q = if current == "shared_with_me" {
-                            "sharedWithMe = true and trashed = false".to_string()
-                        } else {
-                            format!("'{}' in parents and trashed = false", current)
-                        };
-                        crate::api::fetch_files(client_c, token_c, q, txc).await;
-                    }
-                });
-            }
-        }
-        Action::CompleteDownload(id) => {
-            app.dl_manager.queue.retain(|t| t.file.id != id);
-            app.active_dl_task = None;
-            app.download_progress = None;
-
-            // Start next pending
-            if let Some(first) = app
-                .dl_manager
-                .queue
-                .iter_mut()
-                .find(|t| t.status == crate::app::DownloadStatus::Pending)
-            {
-                first.status = crate::app::DownloadStatus::Downloading;
-                let c = client.clone();
-                let t = token.access_token.clone();
-                let txc = tx.clone();
-                let f = first.file.clone();
-                let start_bytes = first.downloaded_bytes;
-                app.active_dl_task = Some(tokio::spawn(async move {
-                    crate::download::download_file_ranged(c, t, f, start_bytes, txc).await;
-                }));
-            } else if !app.dl_manager.queue.is_empty()
-                && app
-                    .dl_manager
-                    .queue
-                    .iter()
-                    .all(|t| t.status == crate::app::DownloadStatus::Paused)
-            {
-                app.status = "Downloads paused.".into();
-            } else if app.dl_manager.queue.is_empty() {
-                app.status = "All downloads complete.".into();
-            }
-        }
-        Action::Error(err) => {
-            app.status = format!("Error: {}", err);
-            app.download_progress = None;
-            app.upload_progress = None;
-            if err.contains("401 Unauthorized") {
-                app.status = "Token expired! Refreshing automatically...".to_string();
-                let client_c = client.clone();
-                let mut token_c = token.clone();
-                let auth_info_c = auth_info.clone();
-                let tx_c = tx.clone();
-                tokio::spawn(async move {
-                    match crate::auth::refresh_token_if_needed(
-                        &client_c,
-                        &auth_info_c,
-                        &mut token_c,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            let _ = tx_c
-                                .send(Event::Action(Action::TokenRefreshed(token_c)))
-                                .await;
-                        }
-                        Err(e) => {
-                            let _ = tx_c
-                                .send(Event::Action(Action::Error(format!(
-                                    "Refresh failed: {}",
-                                    e
-                                ))))
-                                .await;
-                        }
-                    }
-                });
-            }
-        }
-
-        Action::LoadQuota(used, limit) => {
-            app.storage_quota = Some((used, limit));
-        }
-
-        Action::UploadComplete(msg) => {
-            app.upload_progress = None;
-            app.status = msg;
-        }
-        Action::ImagePreview(bytes) => {
-            if app.preview_mode != crate::app::PreviewMode::Hidden {
-                if let Ok(img) = image::load_from_memory(&bytes) {
-                    app.preview_dims = Some((img.width(), img.height()));
-                    app.preview_state =
-                        crate::app::PreviewState::Image(app.picker.new_resize_protocol(img));
-                }
-            }
-        }
-        Action::PreviewMetadataLoaded(name, size, created, modified) => {
-            if app.preview_mode != crate::app::PreviewMode::Hidden {
-                app.preview_state = crate::app::PreviewState::Metadata {
-                    name,
-                    size,
-                    created,
-                    modified,
-                };
-            }
-        }
-    }
-}
-
-pub async fn handle_suspend_and_edit(
-    app: &mut App,
-    file: crate::app::DriveFile,
-    client: &Client,
-    token: &auth::Token,
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-) -> anyhow::Result<()> {
-    // Suspend UI
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    let tmp_path = format!("/tmp/doraivu_edit_{}", file.name);
-    println!("Downloading {} for editing...", file.name);
-
-    // Blocking download
-    let url = format!(
-        "https://www.googleapis.com/drive/v3/files/{}?alt=media",
-        file.id
-    );
-    match client
-        .get(&url)
-        .bearer_auth(&token.access_token)
-        .send()
-        .await
-    {
-        Ok(res) if res.status().is_success() => {
-            let bytes = res.bytes().await?;
-            std::fs::write(&tmp_path, &bytes)?;
-
-            let before_metadata = std::fs::metadata(&tmp_path)?;
-
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
-            let mut child = tokio::process::Command::new(editor)
-                .arg(&tmp_path)
-                .spawn()?;
-
-            child.wait().await?;
-
-            let after_metadata = std::fs::metadata(&tmp_path)?;
-            if after_metadata.modified()? > before_metadata.modified()? {
-                println!("File changed, uploading...");
-
-                let new_content = std::fs::read(&tmp_path)?;
-                let upload_url = format!(
-                    "https://www.googleapis.com/upload/drive/v3/files/{}?uploadType=media",
-                    file.id
-                );
-                let patch_res = client
-                    .patch(&upload_url)
-                    .bearer_auth(&token.access_token)
-                    .header("Content-Type", &file.mime_type)
-                    .body(new_content)
-                    .send()
-                    .await?;
-
-                if patch_res.status().is_success() {
-                    app.status = format!("Successfully updated {}", file.name);
-                } else {
-                    app.status = format!("Upload failed: {}", patch_res.status());
-                }
-            } else {
-                app.status = "No changes made.".into();
-            }
-            let _ = std::fs::remove_file(&tmp_path);
-        }
-        _ => {
-            app.status = "Failed to download file for editing.".into();
-        }
-    }
-
-    Ok(())
 }

@@ -1,14 +1,14 @@
+use crate::drive::models::{DownloadStatus, UploadStatus};
+use crate::tui::state::App;
 use ratatui::{
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame,
 };
 
-use crate::app::App;
-
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -49,6 +49,250 @@ fn centered_rect(
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Renders the trash file list
+pub fn render_trash_block(f: &mut Frame, area: Rect, app: &mut App) {
+    let items: Vec<ListItem> = app
+        .trashed_files
+        .iter()
+        .map(|file| {
+            let icon = if file.mime_type == "application/vnd.google-apps.folder" {
+                "📁"
+            } else {
+                "📄"
+            };
+            ListItem::new(Line::from(format!("{} {}", icon, file.name)))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Trash ")
+                .title_bottom(
+                    Line::from(" [Esc] Close   [r] Restore   [x] Delete   [X] Delete All ")
+                        .alignment(ratatui::layout::Alignment::Center),
+                )
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+    f.render_stateful_widget(list, area, &mut app.trash_state);
+}
+
+/// Renders the download tracker view
+pub fn render_dl_tracker(f: &mut Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let items: Vec<ListItem> = app
+        .dl_manager
+        .queue
+        .iter()
+        .map(|task| {
+            let prefix = match task.status {
+                DownloadStatus::Pending => "⏳ ",
+                DownloadStatus::Downloading => "↓ ",
+                DownloadStatus::Paused => "⏸ ",
+            };
+
+            let pct = if task.total_bytes > 0 {
+                (task.downloaded_bytes as f64 / task.total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let color = match task.status {
+                DownloadStatus::Downloading => Color::Green,
+                DownloadStatus::Paused => Color::Yellow,
+                DownloadStatus::Pending => Color::Gray,
+            };
+
+            let status_text = match task.status {
+                DownloadStatus::Downloading => {
+                    format!("[Downloading] {} {:.1}%", task.file.name, pct)
+                }
+                DownloadStatus::Paused => format!("[Paused] {} {:.1}%", task.file.name, pct),
+                DownloadStatus::Pending => format!("[Pending] {}", task.file.name),
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(color)),
+                Span::styled(status_text, Style::default().fg(color)),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Download Queue ")
+                .title_bottom(
+                    Line::from(" [Esc] Close   [x] Cancel   [p] Pause   [r] Resume ")
+                        .alignment(ratatui::layout::Alignment::Center),
+                )
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+    f.render_stateful_widget(list, chunks[0], &mut app.dl_manager.state);
+
+    let points: Vec<(f64, f64)> = app
+        .dl_manager
+        .speed_history
+        .iter()
+        .enumerate()
+        .map(|(i, &speed)| (i as f64, speed as f64 / 1_048_576.0))
+        .collect();
+
+    let max_y = points.iter().map(|&(_, y)| y).fold(0.0_f64, f64::max);
+    let bound_y = if max_y < 1.0 { 1.0 } else { max_y * 1.2 };
+
+    let datasets = vec![ratatui::widgets::Dataset::default()
+        .name("MB/s")
+        .marker(ratatui::symbols::Marker::Braille)
+        .graph_type(ratatui::widgets::GraphType::Bar)
+        .style(Style::default().fg(Color::Green))
+        .data(&points)];
+
+    let chart = ratatui::widgets::Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(format!(" Bandwidth (Max: {:.1} MB/s) ", max_y))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .x_axis(
+            ratatui::widgets::Axis::default()
+                .bounds([0.0, 100.0])
+                .style(Style::default().fg(Color::Reset)),
+        )
+        .y_axis(
+            ratatui::widgets::Axis::default()
+                .bounds([0.0, bound_y])
+                .style(Style::default().fg(Color::Reset)),
+        );
+
+    f.render_widget(chart, chunks[1]);
+}
+
+/// Renders the upload tracker view
+pub fn render_ul_tracker(f: &mut Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let items: Vec<ListItem> = app
+        .ul_manager
+        .queue
+        .iter()
+        .map(|task| {
+            let prefix = match task.status {
+                UploadStatus::Pending => "⏳ ",
+                UploadStatus::Uploading => "↑ ",
+                UploadStatus::Paused => "⏸ ",
+            };
+
+            let pct = if task.total_bytes > 0 {
+                (task.uploaded_bytes as f64 / task.total_bytes as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let color = match task.status {
+                UploadStatus::Uploading => Color::Green,
+                UploadStatus::Paused => Color::Yellow,
+                UploadStatus::Pending => Color::Gray,
+            };
+
+            let status_text = match task.status {
+                UploadStatus::Uploading => {
+                    format!("[Uploading] {} {:.1}%", task.name, pct)
+                }
+                UploadStatus::Paused => format!("[Paused] {} {:.1}%", task.name, pct),
+                UploadStatus::Pending => format!("[Pending] {}", task.name),
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(color)),
+                Span::styled(status_text, Style::default().fg(color)),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Upload Queue ")
+                .title_bottom(
+                    Line::from(" [Esc] Close   [x] Cancel   [p] Pause   [r] Resume ")
+                        .alignment(ratatui::layout::Alignment::Center),
+                )
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+    f.render_stateful_widget(list, chunks[0], &mut app.ul_manager.state);
+
+    let points: Vec<(f64, f64)> = app
+        .ul_manager
+        .speed_history
+        .iter()
+        .enumerate()
+        .map(|(i, &speed)| (i as f64, speed as f64 / 1_048_576.0))
+        .collect();
+
+    let max_y = points.iter().map(|&(_, y)| y).fold(0.0_f64, f64::max);
+    let bound_y = if max_y < 1.0 { 1.0 } else { max_y * 1.2 };
+
+    let datasets = vec![ratatui::widgets::Dataset::default()
+        .name("MB/s")
+        .marker(ratatui::symbols::Marker::Braille)
+        .graph_type(ratatui::widgets::GraphType::Bar)
+        .style(Style::default().fg(Color::Green))
+        .data(&points)];
+
+    let chart = ratatui::widgets::Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(format!(" Bandwidth (Max: {:.1} MB/s) ", max_y))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .x_axis(
+            ratatui::widgets::Axis::default()
+                .bounds([0.0, 100.0])
+                .style(Style::default().fg(Color::Reset)),
+        )
+        .y_axis(
+            ratatui::widgets::Axis::default()
+                .bounds([0.0, bound_y])
+                .style(Style::default().fg(Color::Reset)),
+        );
+
+    f.render_widget(chart, chunks[1]);
 }
 
 /// Renders the entire TUI application state into the given terminal frame
@@ -114,13 +358,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
         )
         .highlight_symbol(">> ");
 
-    if app.input_mode == crate::app::InputMode::TrashView
-        || app.input_mode == crate::app::InputMode::TrashDeleteConfirmModal
-        || app.input_mode == crate::app::InputMode::TrashDeleteAllConfirmModal
+    if app.input_mode == crate::tui::state::InputMode::TrashView
+        || app.input_mode == crate::tui::state::InputMode::TrashDeleteConfirmModal
+        || app.input_mode == crate::tui::state::InputMode::TrashDeleteAllConfirmModal
     {
-        crate::trash::render_trash_block(f, chunks[1], app);
+        render_trash_block(f, chunks[1], app);
 
-        if app.input_mode == crate::app::InputMode::TrashDeleteConfirmModal {
+        if app.input_mode == crate::tui::state::InputMode::TrashDeleteConfirmModal {
             let area = centered_rect(40, 6, f.area());
             use ratatui::widgets::Clear;
             f.render_widget(Clear, area);
@@ -148,7 +392,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .block(block);
 
             f.render_widget(p, area);
-        } else if app.input_mode == crate::app::InputMode::TrashDeleteAllConfirmModal {
+        } else if app.input_mode == crate::tui::state::InputMode::TrashDeleteAllConfirmModal {
             let area = centered_rect(40, 6, f.area());
             use ratatui::widgets::Clear;
             f.render_widget(Clear, area);
@@ -170,14 +414,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
             f.render_widget(p, area);
         }
-    } else if app.input_mode == crate::app::InputMode::DownloadTrackerView {
-        crate::download::render_tracker_block(f, chunks[1], app);
-    } else if app.input_mode == crate::app::InputMode::UploadTrackerView {
-        crate::upload::render_tracker_block(f, chunks[1], app);
-    } else if app.preview_mode != crate::app::PreviewMode::Hidden {
+    } else if app.input_mode == crate::tui::state::InputMode::DownloadTrackerView {
+        render_dl_tracker(f, chunks[1], app);
+    } else if app.input_mode == crate::tui::state::InputMode::UploadTrackerView {
+        render_ul_tracker(f, chunks[1], app);
+    } else if app.preview_mode != crate::tui::state::PreviewMode::Hidden {
         match &mut app.preview_state {
-            crate::app::PreviewState::Image(ref mut protocol) => {
-                let available_height = chunks[1].height.saturating_sub(2); // borders
+            crate::tui::state::PreviewState::Image(ref mut protocol) => {
+                let available_height = chunks[1].height.saturating_sub(2);
                 let preview_width = if let Some((img_w, img_h)) = app.preview_dims {
                     let font_ratio = 2.0_f64;
                     if img_h > 0 {
@@ -205,7 +449,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 use ratatui_image::StatefulImage;
                 f.render_stateful_widget(StatefulImage::new(), inner_area, protocol);
             }
-            crate::app::PreviewState::Metadata {
+            crate::tui::state::PreviewState::Metadata {
                 name,
                 size,
                 created,
@@ -220,36 +464,24 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 let preview_block = Block::default().borders(Borders::ALL).title(" Metadata ");
                 let text = vec![
                     Line::from(vec![
-                        ratatui::text::Span::styled(
-                            "Name: ",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        ratatui::text::Span::raw(name.clone()),
+                        Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(name.clone()),
                     ]),
                     Line::from(vec![
-                        ratatui::text::Span::styled(
-                            "Size: ",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        ratatui::text::Span::raw(if let Some(s) = size {
+                        Span::styled("Size: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(if let Some(s) = size {
                             format_bytes(*s)
                         } else {
                             "-".to_string()
                         }),
                     ]),
                     Line::from(vec![
-                        ratatui::text::Span::styled(
-                            "Created: ",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        ratatui::text::Span::raw(crate::api::format_time(created)),
+                        Span::styled("Created: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(crate::drive::api::format_time(created)),
                     ]),
                     Line::from(vec![
-                        ratatui::text::Span::styled(
-                            "Modified: ",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        ratatui::text::Span::raw(crate::api::format_time(modified)),
+                        Span::styled("Modified: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(crate::drive::api::format_time(modified)),
                     ]),
                 ];
                 let p = Paragraph::new(text)
@@ -257,7 +489,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     .wrap(ratatui::widgets::Wrap { trim: true });
                 f.render_widget(p, center_chunks[1]);
             }
-            crate::app::PreviewState::Loading => {
+            crate::tui::state::PreviewState::Loading => {
                 let center_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
@@ -269,7 +501,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                     center_chunks[1],
                 );
             }
-            crate::app::PreviewState::None => {
+            crate::tui::state::PreviewState::None => {
                 let center_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
@@ -289,10 +521,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // Bottom block: Status/Search and Quota
     let bottom_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(0),
-            Constraint::Length(35), // Fixed width for quota
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(35)])
         .split(chunks[2]);
 
     // Status / Search
@@ -308,7 +537,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             format_bytes(total),
             format_bytes(speed as u64)
         );
-        let span = ratatui::text::Span::styled(
+        let span = Span::styled(
             label,
             Style::default()
                 .fg(Color::Yellow)
@@ -336,7 +565,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             format_bytes(total),
             format_bytes(speed as u64)
         );
-        let span = ratatui::text::Span::styled(
+        let span = Span::styled(
             label,
             Style::default()
                 .fg(Color::Yellow)
@@ -369,7 +598,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
         let label = format!("{} / {}", format_bytes(used), format_bytes(limit));
 
-        let span = ratatui::text::Span::styled(
+        let span = Span::styled(
             label,
             Style::default()
                 .fg(Color::Yellow)
@@ -387,7 +616,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         f.render_widget(empty_block, bottom_chunks[1]);
     }
 
-    if app.input_mode == crate::app::InputMode::DeleteConfirmModal {
+    if app.input_mode == crate::tui::state::InputMode::DeleteConfirmModal {
         let area = centered_rect(40, 6, f.area());
         use ratatui::widgets::Clear;
         f.render_widget(Clear, area);
@@ -410,7 +639,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .block(block);
 
         f.render_widget(p, area);
-    } else if app.input_mode == crate::app::InputMode::DownloadConfirmModal {
+    } else if app.input_mode == crate::tui::state::InputMode::DownloadConfirmModal {
         let area = centered_rect(40, 6, f.area());
         use ratatui::widgets::Clear;
         f.render_widget(Clear, area);
@@ -433,8 +662,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
             .block(block);
 
         f.render_widget(p, area);
-    } else if app.input_mode == crate::app::InputMode::UploadModal {
-        let area = centered_rect(60, 12, f.area()); // 12 lines fixed height
+    } else if app.input_mode == crate::tui::state::InputMode::UploadModal {
+        let area = centered_rect(60, 12, f.area());
         use ratatui::widgets::Clear;
         f.render_widget(Clear, area);
 

@@ -1,25 +1,25 @@
-mod api;
-mod app;
-mod auth;
-mod download;
-mod handlers;
-mod trash;
-mod ui;
-mod upload;
+mod cli;
+mod drive;
+mod tui;
 
 use anyhow::Result;
-use api::fetch_quota;
-use app::{App, Event};
-use auth::{authenticate, AuthInfo};
 use crossterm::{
     event::{self, Event as CEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use drive::api::fetch_quota;
+use drive::auth::{self, authenticate, AuthInfo};
+use drive::models::DriveFile;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use reqwest::Client;
 use std::{env, io, time::Duration};
 use tokio::sync::mpsc;
+use tui::actions::handle_action;
+use tui::events::handle_input;
+use tui::layout;
+use tui::preview::handle_suspend_and_edit;
+use tui::state::{App, Event};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -107,12 +107,12 @@ async fn main() -> Result<()> {
 
     // Initialize Virtual Root
     app.files = vec![
-        crate::app::DriveFile {
+        DriveFile {
             id: "root".to_string(),
             name: "My Drive".to_string(),
             mime_type: "application/vnd.google-apps.folder".to_string(),
         },
-        crate::app::DriveFile {
+        DriveFile {
             id: "shared_with_me".to_string(),
             name: "Shared with me".to_string(),
             mime_type: "application/vnd.google-apps.folder".to_string(),
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
 
     // Main loop
     while !app.should_quit {
-        terminal.draw(|f| ui::render(f, &mut app))?;
+        terminal.draw(|f| layout::render(f, &mut app))?;
 
         if let Some(event) = rx.recv().await {
             match event {
@@ -169,22 +169,15 @@ async fn main() -> Result<()> {
                     let _ = terminal.clear();
                 }
                 Event::Input(key) => {
-                    crate::handlers::handle_input(&mut app, key, &client, &token, &tx);
+                    handle_input(&mut app, key, &client, &token, &tx);
                 }
                 Event::Action(action) => {
-                    crate::handlers::handle_action(
-                        &mut app, action, &client, &mut token, &auth_info, &tx,
-                    );
+                    handle_action(&mut app, action, &client, &mut token, &auth_info, &tx);
                 }
                 Event::SuspendAndEdit(file) => {
-                    if let Err(e) = crate::handlers::handle_suspend_and_edit(
-                        &mut app,
-                        file,
-                        &client,
-                        &token,
-                        &mut terminal,
-                    )
-                    .await
+                    if let Err(e) =
+                        handle_suspend_and_edit(&mut app, file, &client, &token, &mut terminal)
+                            .await
                     {
                         app.status = format!("Edit error: {}", e);
                     }
@@ -199,37 +192,4 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     std::process::exit(0);
-}
-
-pub(crate) fn trigger_preview(
-    app: &mut App,
-    client: &Client,
-    token: &str,
-    tx: &mpsc::Sender<Event>,
-) {
-    if app.preview_mode == crate::app::PreviewMode::Hidden {
-        return;
-    }
-    app.preview_state = crate::app::PreviewState::Loading;
-    app.preview_dims = None;
-    if let Some(file) = app.selected_file() {
-        let c = client.clone();
-        let t = token.to_string();
-        let fid = file.id.clone();
-        let txc = tx.clone();
-
-        if file.mime_type.starts_with("image/")
-            && app.preview_mode == crate::app::PreviewMode::Default
-        {
-            tokio::spawn(async move {
-                crate::api::fetch_preview(c, t, fid, txc).await;
-            });
-        } else if file.mime_type != "application/vnd.google-apps.folder" {
-            tokio::spawn(async move {
-                crate::api::fetch_metadata(c, t, fid, txc).await;
-            });
-        } else {
-            app.preview_state = crate::app::PreviewState::None;
-        }
-    }
 }

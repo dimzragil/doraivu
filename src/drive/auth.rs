@@ -122,40 +122,69 @@ pub async fn authenticate(client: &Client, auth_info: &AuthInfo) -> Result<Token
         println!("Failed to open browser automatically: {}", e);
     }
 
-    // Wait for single incoming connection
-    let (mut stream, _) = listener.accept().await?;
-    let mut buf = [0; 4096];
-    let n = stream.read(&mut buf).await?;
-    let request = String::from_utf8_lossy(&buf[..n]);
-
     let mut auth_code = None;
-    for line in request.lines() {
-        if line.starts_with("GET ") {
-            if let Some(path) = line.split_whitespace().nth(1) {
-                if let Some(query) = path.split('?').nth(1) {
-                    for pair in query.split('&') {
-                        let mut parts = pair.split('=');
-                        if parts.next() == Some("code") {
-                            if let Some(code) = parts.next() {
-                                auth_code = Some(code.to_string());
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let mut buf = [0; 4096];
+        let read_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf))
+                .await;
+        let n = match read_result {
+            Ok(Ok(size)) => size,
+            _ => continue,
+        };
+        if n == 0 {
+            continue;
+        }
+
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let mut found_code = false;
+
+        for line in request.lines() {
+            if line.starts_with("GET ") {
+                if let Some(path) = line.split_whitespace().nth(1) {
+                    if let Some(query) = path.split('?').nth(1) {
+                        for pair in query.split('&') {
+                            let mut parts = pair.split('=');
+                            if parts.next() == Some("code") {
+                                if let Some(code) = parts.next() {
+                                    auth_code = Some(code.to_string());
+                                    found_code = true;
+                                }
                             }
                         }
                     }
                 }
+                break;
             }
+        }
+
+        if found_code {
+            let body =
+                "Authorization successful! You can close this tab and return to the terminal.";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
             break;
+        } else {
+            let body = "Not found";
+            let resp = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
         }
     }
 
     let Some(code) = auth_code else {
-        let resp = "HTTP/1.1 400 Bad Request\r\n\r\nAuthorization failed: No code found.";
-        let _ = stream.write_all(resp.as_bytes()).await;
         anyhow::bail!("No authorization code found in HTTP request.");
     };
-
-    let resp = "HTTP/1.1 200 OK\r\n\r\nAuthorization successful! You can close this tab and return to the terminal.";
-    let _ = stream.write_all(resp.as_bytes()).await;
-    let _ = stream.flush().await;
 
     // Exchange code for token
     let res = client

@@ -1,4 +1,5 @@
-use crate::app::{Action, DriveFile, Event};
+use crate::drive::models::{DriveFile, UploadStatus, UploadTask};
+use crate::tui::state::{Action, Event};
 use reqwest::Client;
 use tokio::sync::mpsc;
 
@@ -84,7 +85,7 @@ pub async fn trash_file(
     }
 }
 
-/// Downloads a file from Google Drive to the user's Downloads folder
+/// Fetches storage quota information
 pub async fn fetch_quota(client: Client, access_token: String, tx: mpsc::Sender<Event>) {
     let url = "https://www.googleapis.com/drive/v3/about?fields=storageQuota";
     match client.get(url).bearer_auth(&access_token).send().await {
@@ -324,13 +325,13 @@ pub async fn upload_file(
                     queue.push((path, next_parent_id));
                 } else {
                     let total_bytes = entry_meta.len();
-                    let task = crate::app::UploadTask {
+                    let task = UploadTask {
                         local_path: path.to_string_lossy().to_string(),
                         name,
                         target_parent_id: current_parent_id.clone(),
                         total_bytes,
                         uploaded_bytes: 0,
-                        status: crate::app::UploadStatus::Pending,
+                        status: UploadStatus::Pending,
                     };
                     let _ = tx
                         .send(Event::Action(Action::QueueUploads(vec![task])))
@@ -350,13 +351,13 @@ pub async fn upload_file(
             .to_string_lossy()
             .to_string();
         let total_bytes = metadata.len();
-        let task = crate::app::UploadTask {
+        let task = UploadTask {
             local_path,
             name: file_name,
             target_parent_id: parent_id,
             total_bytes,
             uploaded_bytes: 0,
-            status: crate::app::UploadStatus::Pending,
+            status: UploadStatus::Pending,
         };
         let _ = tx
             .send(Event::Action(Action::QueueUploads(vec![task])))
@@ -390,7 +391,7 @@ pub async fn fetch_metadata(
                 let created = data.created_time.unwrap_or_else(|| "Unknown".to_string());
                 let modified = data.modified_time.unwrap_or_else(|| "Unknown".to_string());
                 let _ = tx
-                    .send(Event::Action(crate::app::Action::PreviewMetadataLoaded(
+                    .send(Event::Action(Action::PreviewMetadataLoaded(
                         data.name, size, created, modified,
                     )))
                     .await;

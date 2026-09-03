@@ -1,11 +1,5 @@
-use crate::app::{Action, App, DriveFile, Event};
-use ratatui::{
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, List, ListItem},
-    Frame,
-};
+use crate::drive::models::DriveFile;
+use crate::tui::state::{Action, Event};
 use reqwest::Client;
 use tokio::sync::mpsc;
 
@@ -124,41 +118,4 @@ pub async fn empty_trash(
         ))))
         .await;
     fetch_trash(client, access_token, tx).await;
-}
-
-pub fn render_trash_block(f: &mut Frame, area: Rect, app: &mut App) {
-    let items: Vec<ListItem> = app
-        .trashed_files
-        .iter()
-        .map(|file| {
-            let icon = if file.mime_type == "application/vnd.google-apps.folder" {
-                "📁"
-            } else {
-                "📄"
-            };
-            ListItem::new(Line::from(format!("{} {}", icon, file.name)))
-        })
-        .collect();
-
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Trash ")
-                .title_bottom(
-                    ratatui::text::Line::from(
-                        " [Esc] Close   [r] Restore   [x] Delete   [X] Delete All ",
-                    )
-                    .alignment(ratatui::layout::Alignment::Center),
-                )
-                .border_style(Style::default().fg(Color::Red)),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
-
-    f.render_stateful_widget(list, area, &mut app.trash_state);
 }
