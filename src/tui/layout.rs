@@ -954,6 +954,52 @@ fn render_modals(f: &mut Frame, app: &App) {
 
             f.set_cursor_position((area.x + 1 + col as u16, area.y + 1));
         }
+        InputMode::OpenExternalModal => {
+            let area = centered_rect(65, 7, f.area());
+            f.render_widget(Clear, area);
+
+            // Outer floating modal dialog box
+            let block = Block::default()
+                .title(" [ Open Public / External Folder ] ")
+                .title_bottom(
+                    Line::from(" [Esc] Cancel | [Enter] Open ").alignment(Alignment::Right),
+                )
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow));
+            f.render_widget(block, area);
+
+            // Split into prompt instruction (1 line) and input text box (3 lines)
+            let modal_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([Constraint::Length(1), Constraint::Length(3)])
+                .split(area);
+
+            let instructions =
+                Paragraph::new("Paste Google Drive folder URL or ID, then press Enter:")
+                    .style(Style::default().fg(Color::Gray));
+            f.render_widget(instructions, modal_chunks[0]);
+
+            // Calculate horizontal scrolling slice and cursor offset
+            let inner_width = modal_chunks[1].width.saturating_sub(2) as usize;
+            let (visible, col) = crate::tui::input::compute_visible_input(
+                &app.external_input_buffer,
+                app.external_input_cursor,
+                inner_width,
+            );
+
+            let input_box = Paragraph::new(visible)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                )
+                .style(Style::default().fg(Color::Yellow));
+            f.render_widget(input_box, modal_chunks[1]);
+
+            // Position the terminal hardware cursor inside the input box
+            f.set_cursor_position((modal_chunks[1].x + 1 + col as u16, modal_chunks[1].y + 1));
+        }
         _ => {}
     }
 }

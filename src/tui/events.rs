@@ -44,6 +44,9 @@ pub fn handle_input(
         state::InputMode::NewFolderModal => {
             handle_new_folder_modal_keys(app, key, client, token, tx);
         }
+        state::InputMode::OpenExternalModal => {
+            handle_open_external_modal_keys(app, key, client, token, tx);
+        }
         state::InputMode::Normal => {
             if app.search.active {
                 handle_search_keys(app, key, client, token, tx);
@@ -154,6 +157,148 @@ fn handle_new_folder_modal_keys(
             crate::tui::input::handle_input_key(
                 &mut app.new_folder_buffer,
                 &mut app.new_folder_cursor,
+                key,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Open External Modal Handler
+// ---------------------------------------------------------------------------
+
+/// Extracts a Google Drive folder ID from a URL, web link, or raw ID.
+///
+/// Supported input formats:
+/// 1. Query parameter: `https://drive.google.com/open?id=<FOLDER_ID>`
+/// 2. Folders path: `https://drive.google.com/drive/folders/<FOLDER_ID>?usp=sharing`
+///    or with user account prefix: `https://drive.google.com/drive/u/0/folders/<FOLDER_ID>`
+/// 3. Direct resource path: `https://drive.google.com/file/d/<FOLDER_ID>/view`
+/// 4. Raw alphanumeric ID: `<FOLDER_ID>` (e.g. `1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs`)
+///
+/// If a URL is passed but does not contain a recognizable Google Drive folder ID,
+/// this function returns an empty string to avoid false positives.
+pub fn extract_folder_id(input: &str) -> String {
+    let trimmed = input.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Pattern 1: Query param id= (e.g. drive.google.com/open?id=1AbCdEf...)
+    if let Some(idx) = trimmed.find("id=") {
+        let after = &trimmed[idx + 3..];
+        let id = after
+            .split(&['&', '#', ' ', '?', '/'][..])
+            .next()
+            .unwrap_or("");
+        let id = id.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+
+    // Pattern 2: /folders/ (e.g. drive.google.com/drive/folders/1AbCdEf... or /drive/u/0/folders/1AbCdEf...)
+    if let Some(idx) = trimmed.find("/folders/") {
+        let after = &trimmed[idx + 9..];
+        let id = after
+            .split(&['?', '/', '&', '#', ' '][..])
+            .next()
+            .unwrap_or("");
+        let id = id.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+
+    // Pattern 3: /d/ (e.g. drive.google.com/file/d/1AbCdEf.../view or drive.google.com/drive/d/1AbCdEf...)
+    if let Some(idx) = trimmed.find("/d/") {
+        let after = &trimmed[idx + 3..];
+        let id = after
+            .split(&['?', '/', '&', '#', ' '][..])
+            .next()
+            .unwrap_or("");
+        let id = id.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+
+    // If the input was recognized as a URL or domain but none of the Google Drive patterns matched,
+    // reject it rather than treating domain names or URL paths as a raw ID.
+    let is_url_like = trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("drive.google.com");
+    if is_url_like {
+        return String::new();
+    }
+
+    // Pattern 4: Raw folder ID (strip optional trailing parameters or slashes)
+    let raw = trimmed
+        .split(&['?', '&', '#', ' '][..])
+        .next()
+        .unwrap_or(trimmed);
+    let last_seg = raw.trim_end_matches('/').rsplit('/').next().unwrap_or(raw);
+    last_seg.trim().to_string()
+}
+
+/// Handles key events when the Open External Folder modal is active.
+fn handle_open_external_modal_keys(
+    app: &mut App,
+    key: KeyEvent,
+    client: &Client,
+    token: &auth::Token,
+    tx: &mpsc::Sender<Event>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            // Cancel and clear buffer
+            app.external_input_buffer.clear();
+            app.external_input_cursor = 0;
+            app.input_mode = state::InputMode::Normal;
+        }
+        KeyCode::Enter => {
+            let input = std::mem::take(&mut app.external_input_buffer);
+            app.external_input_cursor = 0;
+            app.input_mode = state::InputMode::Normal;
+
+            let folder_id = extract_folder_id(&input);
+            if folder_id.is_empty() {
+                app.status = "Open folder cancelled: invalid URL or ID.".into();
+                return;
+            }
+
+            // Cancel any ongoing preview tasks from previous folder to avoid stale previews
+            if let Some(task) = app.preview.active_task.take() {
+                task.abort();
+            }
+            app.preview.state = state::PreviewState::None;
+
+            // Update navigation history and display breadcrumb (take 8 chars safely without UTF-8 panic)
+            app.nav.history.push(app.nav.current_path.clone());
+            let short_id: String = folder_id.chars().take(8).collect();
+            app.nav.path_names.push(format!("External ({})", short_id));
+            app.nav.current_path = folder_id.clone();
+            app.status = format!("Loading external folder: {}...", folder_id);
+
+            // Reset current file list and selection while fetching
+            app.files.clear();
+            app.selected_files.clear();
+            app.state.select(None);
+
+            let c = client.clone();
+            let t = token.access_token.clone();
+            let txc = tx.clone();
+            let fid = folder_id;
+
+            tokio::spawn(async move {
+                let q = format!("'{}' in parents and trashed = false", fid);
+                fetch_files(c, t, q, txc).await;
+            });
+        }
+        _ => {
+            crate::tui::input::handle_input_key(
+                &mut app.external_input_buffer,
+                &mut app.external_input_cursor,
                 key,
             );
         }
@@ -971,6 +1116,11 @@ fn handle_normal_keys(
             app.new_folder_cursor = 0;
             app.input_mode = state::InputMode::NewFolderModal;
         }
+        KeyCode::Char('O') => {
+            app.external_input_buffer.clear();
+            app.external_input_cursor = 0;
+            app.input_mode = state::InputMode::OpenExternalModal;
+        }
         KeyCode::Char('c') => {
             if let Some(file) = app.selected_file().cloned() {
                 app.rename.target_id = file.id;
@@ -1106,7 +1256,7 @@ fn handle_normal_keys(
                     }
 
                     let url = format!(
-                        "https://www.googleapis.com/drive/v3/files/{}?alt=media",
+                        "https://www.googleapis.com/drive/v3/files/{}?alt=media&supportsAllDrives=true",
                         file.id
                     );
                     let token_str = token.access_token.clone();
@@ -1324,5 +1474,180 @@ mod tests {
     fn test_extract_mpv_resume_time_none() {
         assert_eq!(extract_mpv_resume_time("No status message here"), None);
         assert_eq!(extract_mpv_resume_time("MPV_RESUME_TIME:0.0"), None);
+    }
+
+    #[test]
+    fn test_extract_folder_id_various_formats() {
+        // Standard folders link
+        assert_eq!(
+            extract_folder_id(
+                "https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+            ),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // Folders link with query parameter (?usp=sharing)
+        assert_eq!(
+            extract_folder_id("https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs?usp=sharing"),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // User prefixed folder link (/u/0/folders/...)
+        assert_eq!(
+            extract_folder_id(
+                "https://drive.google.com/drive/u/0/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+            ),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // User prefixed folder link with resourcekey and sharing
+        assert_eq!(
+            extract_folder_id("https://drive.google.com/drive/u/1/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs?resourcekey=0-xyz&usp=sharing"),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // open?id= link
+        assert_eq!(
+            extract_folder_id(
+                "https://drive.google.com/open?id=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs&usp=sharing"
+            ),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // file / folder with /d/
+        assert_eq!(
+            extract_folder_id("https://drive.google.com/file/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs/view?usp=sharing"),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // Raw ID
+        assert_eq!(
+            extract_folder_id("1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // Quoted raw ID with whitespace
+        assert_eq!(
+            extract_folder_id(" \" 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs \" "),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // Query param id after other parameters
+        assert_eq!(
+            extract_folder_id(
+                "https://drive.google.com/open?usp=sharing&id=1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+            ),
+            "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs"
+        );
+        // Invalid URLs without folder ID should not return domain or segment name
+        assert_eq!(
+            extract_folder_id("https://drive.google.com/drive/folders/"),
+            ""
+        );
+        assert_eq!(extract_folder_id("https://drive.google.com/"), "");
+        assert_eq!(extract_folder_id("https://randomsite.com/test"), "");
+        // Empty string
+        assert_eq!(extract_folder_id(""), "");
+        assert_eq!(extract_folder_id("   "), "");
+    }
+
+    #[tokio::test]
+    async fn test_open_external_modal_esc_and_normal_key_o() {
+        let mut app = App::new();
+        let client = Client::new();
+        let token = auth::Token {
+            access_token: "dummy".into(),
+            refresh_token: Some("dummy".into()),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+            scope: "".into(),
+        };
+        let (tx, _rx) = mpsc::channel(10);
+
+        // Test pressing 'O' in normal mode
+        assert_eq!(app.input_mode, state::InputMode::Normal);
+        handle_normal_keys(
+            &mut app,
+            KeyEvent::from(KeyCode::Char('O')),
+            &client,
+            &token,
+            &tx,
+        );
+        assert_eq!(app.input_mode, state::InputMode::OpenExternalModal);
+
+        // Modify input buffer
+        app.external_input_buffer = "https://drive.google.com/test".into();
+        app.external_input_cursor = app.external_input_buffer.len();
+
+        // Test pressing Esc in OpenExternalModal
+        handle_open_external_modal_keys(
+            &mut app,
+            KeyEvent::from(KeyCode::Esc),
+            &client,
+            &token,
+            &tx,
+        );
+        assert_eq!(app.input_mode, state::InputMode::Normal);
+        assert!(app.external_input_buffer.is_empty());
+        assert_eq!(app.external_input_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn test_open_external_modal_enter_valid() {
+        let mut app = App::new();
+        let client = Client::new();
+        let token = auth::Token {
+            access_token: "dummy".into(),
+            refresh_token: Some("dummy".into()),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+            scope: "".into(),
+        };
+        let (tx, _rx) = mpsc::channel(10);
+
+        app.input_mode = state::InputMode::OpenExternalModal;
+        app.external_input_buffer =
+            "https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs?usp=sharing"
+                .into();
+        app.external_input_cursor = app.external_input_buffer.len();
+
+        handle_open_external_modal_keys(
+            &mut app,
+            KeyEvent::from(KeyCode::Enter),
+            &client,
+            &token,
+            &tx,
+        );
+
+        assert_eq!(app.input_mode, state::InputMode::Normal);
+        assert_eq!(app.nav.current_path, "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs");
+        assert_eq!(
+            app.nav.path_names.last(),
+            Some(&"External (1BxiMVs0)".to_string())
+        );
+        assert!(app.files.is_empty());
+        assert!(app.selected_files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_open_external_modal_unicode_safety() {
+        let mut app = App::new();
+        let client = Client::new();
+        let token = auth::Token {
+            access_token: "dummy".into(),
+            refresh_token: Some("dummy".into()),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+            scope: "".into(),
+        };
+        let (tx, _rx) = mpsc::channel(10);
+
+        app.input_mode = state::InputMode::OpenExternalModal;
+        // Multi-byte UTF-8 emoji string where byte slicing at index 8 would normally panic
+        app.external_input_buffer = "🎉🎊🚀✨🔥🌟💡FolderID".into();
+        app.external_input_cursor = app.external_input_buffer.len();
+
+        handle_open_external_modal_keys(
+            &mut app,
+            KeyEvent::from(KeyCode::Enter),
+            &client,
+            &token,
+            &tx,
+        );
+
+        assert_eq!(app.input_mode, state::InputMode::Normal);
+        assert!(app.nav.path_names.last().is_some());
     }
 }

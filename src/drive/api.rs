@@ -75,7 +75,7 @@ pub async fn fetch_files(
 
     loop {
         let mut url = format!(
-            "https://www.googleapis.com/drive/v3/files?q={}&pageSize=1000&orderBy=folder,name_natural&fields=nextPageToken,files(id,name,mimeType,appProperties)",
+            "https://www.googleapis.com/drive/v3/files?q={}&pageSize=1000&orderBy=folder,name_natural&fields=nextPageToken,files(id,name,mimeType,appProperties)&supportsAllDrives=true&includeItemsFromAllDrives=true",
             urlencoding::encode(&query)
         );
         if let Some(ref pt) = page_token {
@@ -143,7 +143,10 @@ pub async fn trash_file(
     file_id: String,
     tx: mpsc::Sender<Event>,
 ) {
-    let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true",
+        file_id
+    );
     match send_with_retry(
         || {
             client
@@ -184,7 +187,10 @@ pub async fn rename_file(
     new_name: String,
     tx: mpsc::Sender<Event>,
 ) {
-    let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true",
+        file_id
+    );
     match send_with_retry(
         || {
             client
@@ -257,7 +263,7 @@ pub async fn fetch_preview(
     tx: mpsc::Sender<Event>,
 ) {
     let url = format!(
-        "https://www.googleapis.com/drive/v3/files/{}?alt=media",
+        "https://www.googleapis.com/drive/v3/files/{}?alt=media&supportsAllDrives=true",
         file_id
     );
     match send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await {
@@ -1063,7 +1069,10 @@ pub async fn update_resume_time(
     file_id: String,
     resume_time: String,
 ) -> anyhow::Result<()> {
-    let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true",
+        file_id
+    );
     let payload = serde_json::json!({
         "appProperties": {
             "mpv_resume_time": resume_time

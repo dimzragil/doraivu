@@ -9,7 +9,7 @@ pub async fn fetch_trash(client: Client, access_token: String, tx: mpsc::Sender<
     let mut page_token: Option<String> = None;
 
     loop {
-        let mut url = "https://www.googleapis.com/drive/v3/files?q=trashed=true&orderBy=folder,name_natural&pageSize=1000&fields=nextPageToken,files(id,name,mimeType,appProperties)".to_string();
+        let mut url = "https://www.googleapis.com/drive/v3/files?q=trashed=true&orderBy=folder,name_natural&pageSize=1000&fields=nextPageToken,files(id,name,mimeType,appProperties)&supportsAllDrives=true&includeItemsFromAllDrives=true".to_string();
         if let Some(ref pt) = page_token {
             url.push_str(&format!("&pageToken={}", urlencoding::encode(pt)));
         }
@@ -52,7 +52,10 @@ pub async fn restore_file(
     file_id: String,
     tx: mpsc::Sender<Event>,
 ) {
-    let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true",
+        file_id
+    );
     let body = serde_json::json!({"trashed": false});
     match send_with_retry(
         || client.patch(&url).bearer_auth(&access_token).json(&body),
@@ -81,7 +84,10 @@ pub async fn delete_permanently(
     file_id: String,
     tx: mpsc::Sender<Event>,
 ) {
-    let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
+    let url = format!(
+        "https://www.googleapis.com/drive/v3/files/{}?supportsAllDrives=true",
+        file_id
+    );
     match send_with_retry(|| client.delete(&url).bearer_auth(&access_token), 3).await {
         Ok(res) if res.status().is_success() || res.status().as_u16() == 204 => {
             let _ = tx

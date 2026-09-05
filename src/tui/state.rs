@@ -72,6 +72,7 @@ pub enum InputMode {
     TrashDeleteAllConfirmModal,
     DownloadTrackerView,
     UploadTrackerView,
+    OpenExternalModal,
 }
 
 /// Main event enum for the TUI event loop
@@ -216,6 +217,8 @@ pub struct App {
     pub clipboard: Option<Clipboard>,
     pub new_folder_buffer: String,
     pub new_folder_cursor: usize,
+    pub external_input_buffer: String,
+    pub external_input_cursor: usize,
 
     // Grouped sub-states
     pub download: DownloadState,
@@ -305,6 +308,8 @@ impl App {
             clipboard: None,
             new_folder_buffer: String::new(),
             new_folder_cursor: 0,
+            external_input_buffer: String::new(),
+            external_input_cursor: 0,
             download: DownloadState::default(),
             upload: UploadState::default(),
             rename: RenameState::default(),

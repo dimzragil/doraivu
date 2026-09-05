@@ -12,7 +12,7 @@ pub async fn download_file_ranged(
     tx: mpsc::Sender<Event>,
 ) {
     let url = format!(
-        "https://www.googleapis.com/drive/v3/files/{}?alt=media",
+        "https://www.googleapis.com/drive/v3/files/{}?alt=media&supportsAllDrives=true",
         file.id
     );
 
