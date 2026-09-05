@@ -78,18 +78,14 @@ async fn main() -> Result<()> {
     let mut token = authenticate(&client, &auth_info).await?;
 
     // Check if token expired, refresh if needed
-    // Simple naive check - in production you'd use expiration time
-    if let Err(e) = client
+    if let Ok(res) = client
         .get("https://www.googleapis.com/drive/v3/about?fields=user")
         .bearer_auth(&token.access_token)
         .send()
-        .await?
-        .error_for_status()
+        .await
     {
-        if let Some(status) = e.status() {
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                auth::refresh_token_if_needed(&client, &auth_info, &mut token).await?;
-            }
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let _ = auth::refresh_token_if_needed(&client, &auth_info, &mut token).await;
         }
     }
 

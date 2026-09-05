@@ -16,12 +16,15 @@ pub fn handle_action(
             *token = new_token;
             app.token_refreshed_at = std::time::Instant::now();
             app.is_refreshing_token = false;
-            app.status = "Token refreshed successfully!".to_string();
+            if app.download.active_task.is_none() && app.upload.active_task.is_none() {
+                app.status = "Token refreshed successfully!".to_string();
+            }
 
             // 1. Resume active or pending download automatically
-            if app.active_dl_task.is_none() {
+            if app.download.active_task.is_none() {
                 if let Some(target) = app
-                    .dl_manager
+                    .download
+                    .manager
                     .queue
                     .iter_mut()
                     .find(|t| t.status != models::DownloadStatus::Paused)
@@ -33,7 +36,7 @@ pub fn handle_action(
                     let f = target.file.clone();
                     let start_bytes = target.downloaded_bytes;
                     app.status = format!("Resuming download for {}...", f.name);
-                    app.active_dl_task = Some(tokio::spawn(async move {
+                    app.download.active_task = Some(tokio::spawn(async move {
                         crate::drive::download::download_file_ranged(c, t, f, start_bytes, txc)
                             .await;
                     }));
@@ -41,9 +44,10 @@ pub fn handle_action(
             }
 
             // 2. Resume active or pending upload automatically
-            if app.active_ul_task.is_none() {
+            if app.upload.active_task.is_none() {
                 if let Some(target) = app
-                    .ul_manager
+                    .upload
+                    .manager
                     .queue
                     .iter_mut()
                     .find(|t| t.status != models::UploadStatus::Paused)
@@ -54,18 +58,18 @@ pub fn handle_action(
                     let token_c = token.access_token.clone();
                     let tx_c = tx.clone();
                     app.status = format!("Resuming upload for {}...", target.name);
-                    app.active_ul_task = Some(tokio::spawn(async move {
+                    app.upload.active_task = Some(tokio::spawn(async move {
                         upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                     }));
                 }
             }
 
             // 3. Refresh file view if currently in a real folder
-            if app.current_path != "virtual_root" {
+            if app.nav.current_path != "virtual_root" {
                 let c = client.clone();
                 let t = token.access_token.clone();
                 let txc = tx.clone();
-                let parent_id = app.current_path.clone();
+                let parent_id = app.nav.current_path.clone();
                 tokio::spawn(async move {
                     let q = if parent_id == "shared_with_me" {
                         "sharedWithMe = true and trashed = false".to_string()
@@ -85,10 +89,32 @@ pub fn handle_action(
             app.state
                 .select(if app.files.is_empty() { None } else { Some(0) });
         }
+        Action::RenameSuccess => {
+            app.status = "Rename succeeded. Refreshing...".to_string();
+            let current_path = app.nav.current_path.clone();
+
+            if current_path == "virtual_root" {
+                app.files = models::DriveFile::virtual_root_items();
+                app.state.select(Some(0));
+                return;
+            }
+
+            let c = client.clone();
+            let t = token.access_token.clone();
+            let txc = tx.clone();
+            tokio::spawn(async move {
+                let query = if current_path == "shared_with_me" {
+                    "sharedWithMe = true and trashed = false".to_string()
+                } else {
+                    format!("'{}' in parents and trashed = false", current_path)
+                };
+                crate::drive::api::fetch_files(c, t, query, txc).await;
+            });
+        }
         Action::LoadTrash(files) => {
-            app.trashed_files = files;
-            app.status = format!("Loaded {} trashed items.", app.trashed_files.len());
-            app.trash_state.select(if app.trashed_files.is_empty() {
+            app.trash.files = files;
+            app.status = format!("Loaded {} trashed items.", app.trash.files.len());
+            app.trash.state.select(if app.trash.files.is_empty() {
                 None
             } else {
                 Some(0)
@@ -99,7 +125,7 @@ pub fn handle_action(
         }
         Action::QueueDownloads(files) => {
             for f in files {
-                app.dl_manager.queue.push(models::DownloadTask {
+                app.download.manager.queue.push(models::DownloadTask {
                     file: f,
                     total_bytes: 0,
                     downloaded_bytes: 0,
@@ -107,37 +133,47 @@ pub fn handle_action(
                 });
             }
             // Start if none active
-            if app.active_dl_task.is_none() {
-                if let Some(first) = app.dl_manager.queue.first_mut() {
+            if app.download.active_task.is_none() {
+                if let Some(first) = app.download.manager.queue.first_mut() {
                     first.status = models::DownloadStatus::Downloading;
                     let c = client.clone();
                     let t = token.access_token.clone();
                     let txc = tx.clone();
                     let f = first.file.clone();
-                    app.active_dl_task = Some(tokio::spawn(async move {
+                    app.download.active_task = Some(tokio::spawn(async move {
                         crate::drive::download::download_file_ranged(c, t, f, 0, txc).await;
                     }));
                 }
             }
         }
         Action::UpdateDownloadProgress(id, dl, total, speed) => {
-            if let Some(task) = app.dl_manager.queue.iter_mut().find(|t| t.file.id == id) {
+            if let Some(task) = app
+                .download
+                .manager
+                .queue
+                .iter_mut()
+                .find(|t| t.file.id == id)
+            {
                 task.downloaded_bytes = dl;
                 task.total_bytes = total;
+                if task.status == models::DownloadStatus::Reconnecting {
+                    task.status = models::DownloadStatus::Downloading;
+                }
             }
-            app.dl_manager.speed_history.push_back(speed as u64);
-            if app.dl_manager.speed_history.len() > 100 {
-                app.dl_manager.speed_history.pop_front();
+            app.download.manager.speed_history.push_back(speed as u64);
+            if app.download.manager.speed_history.len() > 100 {
+                app.download.manager.speed_history.pop_front();
             }
-            app.download_progress = Some((dl, total, speed));
+            app.download.progress = Some((dl, total, speed));
         }
         Action::QueueUploads(tasks) => {
             for t in tasks {
-                app.ul_manager.queue.push(t);
+                app.upload.manager.queue.push(t);
             }
-            if app.active_ul_task.is_none() {
+            if app.upload.active_task.is_none() {
                 if let Some(first) = app
-                    .ul_manager
+                    .upload
+                    .manager
                     .queue
                     .iter_mut()
                     .find(|t| t.status == models::UploadStatus::Pending)
@@ -147,31 +183,41 @@ pub fn handle_action(
                     let client_c = client.clone();
                     let token_c = token.access_token.clone();
                     let tx_c = tx.clone();
-                    app.active_ul_task = Some(tokio::spawn(async move {
+                    app.upload.active_task = Some(tokio::spawn(async move {
                         upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                     }));
                 }
             }
-            app.status = format!("{} upload(s) queued.", app.ul_manager.queue.len());
+            app.status = format!("{} upload(s) queued.", app.upload.manager.queue.len());
         }
         Action::UpdateUploadProgress(id, downloaded, total, speed) => {
-            if let Some(task) = app.ul_manager.queue.iter_mut().find(|t| t.local_path == id) {
+            if let Some(task) = app
+                .upload
+                .manager
+                .queue
+                .iter_mut()
+                .find(|t| t.local_path == id)
+            {
                 task.uploaded_bytes = downloaded;
                 task.total_bytes = total;
+                if task.status == models::UploadStatus::Reconnecting {
+                    task.status = models::UploadStatus::Uploading;
+                }
             }
-            app.ul_manager.speed_history.push_back(speed as u64);
-            if app.ul_manager.speed_history.len() > 100 {
-                app.ul_manager.speed_history.pop_front();
+            app.upload.manager.speed_history.push_back(speed as u64);
+            if app.upload.manager.speed_history.len() > 100 {
+                app.upload.manager.speed_history.pop_front();
             }
-            app.upload_progress = Some((downloaded, total, speed));
+            app.upload.progress = Some((downloaded, total, speed));
         }
         Action::CompleteUpload(id) => {
-            app.ul_manager.queue.retain(|t| t.local_path != id);
-            app.active_ul_task = None;
-            app.upload_progress = None;
+            app.upload.manager.queue.retain(|t| t.local_path != id);
+            app.upload.active_task = None;
+            app.upload.progress = None;
 
             if let Some(first) = app
-                .ul_manager
+                .upload
+                .manager
                 .queue
                 .iter_mut()
                 .find(|t| t.status == models::UploadStatus::Pending)
@@ -181,25 +227,26 @@ pub fn handle_action(
                 let client_c = client.clone();
                 let token_c = token.access_token.clone();
                 let tx_c = tx.clone();
-                app.active_ul_task = Some(tokio::spawn(async move {
+                app.upload.active_task = Some(tokio::spawn(async move {
                     upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                 }));
-            } else if !app.ul_manager.queue.is_empty()
+            } else if !app.upload.manager.queue.is_empty()
                 && app
-                    .ul_manager
+                    .upload
+                    .manager
                     .queue
                     .iter()
                     .all(|t| t.status == models::UploadStatus::Paused)
             {
                 app.status = "Uploads paused.".into();
-            } else if app.ul_manager.queue.is_empty() {
+            } else if app.upload.manager.queue.is_empty() {
                 app.status = "All uploads complete.".into();
 
                 // Automatically fetch files after upload is done!
                 let txc = tx.clone();
                 let client_c = client.clone();
                 let token_c = token.access_token.clone();
-                let current = app.current_path.clone();
+                let current = app.nav.current_path.clone();
                 tokio::spawn(async move {
                     if current != "virtual_root" {
                         let q = if current == "shared_with_me" {
@@ -207,19 +254,27 @@ pub fn handle_action(
                         } else {
                             format!("'{}' in parents and trashed = false", current)
                         };
-                        crate::drive::api::fetch_files(client_c, token_c, q, txc).await;
+                        crate::drive::api::fetch_files(
+                            client_c.clone(),
+                            token_c.clone(),
+                            q,
+                            txc.clone(),
+                        )
+                        .await;
+                        crate::drive::api::fetch_quota(client_c, token_c, txc).await;
                     }
                 });
             }
         }
         Action::CompleteDownload(id) => {
-            app.dl_manager.queue.retain(|t| t.file.id != id);
-            app.active_dl_task = None;
-            app.download_progress = None;
+            app.download.manager.queue.retain(|t| t.file.id != id);
+            app.download.active_task = None;
+            app.download.progress = None;
 
             // Start next pending
             if let Some(first) = app
-                .dl_manager
+                .download
+                .manager
                 .queue
                 .iter_mut()
                 .find(|t| t.status == models::DownloadStatus::Pending)
@@ -230,18 +285,19 @@ pub fn handle_action(
                 let txc = tx.clone();
                 let f = first.file.clone();
                 let start_bytes = first.downloaded_bytes;
-                app.active_dl_task = Some(tokio::spawn(async move {
+                app.download.active_task = Some(tokio::spawn(async move {
                     crate::drive::download::download_file_ranged(c, t, f, start_bytes, txc).await;
                 }));
-            } else if !app.dl_manager.queue.is_empty()
+            } else if !app.download.manager.queue.is_empty()
                 && app
-                    .dl_manager
+                    .download
+                    .manager
                     .queue
                     .iter()
                     .all(|t| t.status == models::DownloadStatus::Paused)
             {
                 app.status = "Downloads paused.".into();
-            } else if app.dl_manager.queue.is_empty() {
+            } else if app.download.manager.queue.is_empty() {
                 app.status = "All downloads complete.".into();
             }
         }
@@ -253,10 +309,10 @@ pub fn handle_action(
                 || lower_err.contains("invalid credentials")
                 || lower_err.contains("unauthenticated")
             {
-                app.download_progress = None;
-                app.upload_progress = None;
-                app.active_dl_task = None;
-                app.active_ul_task = None;
+                app.download.progress = None;
+                app.upload.progress = None;
+                app.download.active_task = None;
+                app.upload.active_task = None;
 
                 if !app.is_refreshing_token {
                     app.is_refreshing_token = true;
@@ -310,20 +366,21 @@ pub fn handle_action(
         }
 
         Action::UploadComplete(msg) => {
-            app.upload_progress = None;
+            app.upload.progress = None;
             app.status = msg;
         }
         Action::ImagePreview(bytes) => {
-            if app.preview_mode != PreviewMode::Hidden {
+            if app.preview.mode != PreviewMode::Hidden {
                 if let Ok(img) = image::load_from_memory(&bytes) {
-                    app.preview_dims = Some((img.width(), img.height()));
-                    app.preview_state = PreviewState::Image(app.picker.new_resize_protocol(img));
+                    app.preview.dims = Some((img.width(), img.height()));
+                    app.preview.state =
+                        PreviewState::Image(app.preview.picker.new_resize_protocol(img));
                 }
             }
         }
         Action::PreviewMetadataLoaded(name, size, created, modified) => {
-            if app.preview_mode != PreviewMode::Hidden {
-                app.preview_state = PreviewState::Metadata {
+            if app.preview.mode != PreviewMode::Hidden {
+                app.preview.state = PreviewState::Metadata {
                     name,
                     size,
                     created,
@@ -339,6 +396,47 @@ pub fn handle_action(
                 props.insert("mpv_resume_time".to_string(), time.clone());
             }
             app.status = format!("Saved playback position ({}s).", time);
+        }
+        Action::SetDownloadReconnecting(id) => {
+            if let Some(task) = app
+                .download
+                .manager
+                .queue
+                .iter_mut()
+                .find(|t| t.file.id == id)
+            {
+                task.status = models::DownloadStatus::Reconnecting;
+            }
+        }
+        Action::SetUploadReconnecting(local_path) => {
+            if let Some(task) = app
+                .upload
+                .manager
+                .queue
+                .iter_mut()
+                .find(|t| t.local_path == local_path)
+            {
+                task.status = models::UploadStatus::Reconnecting;
+            }
+        }
+        Action::RefreshFolder(folder_id) => {
+            if app.nav.current_path == folder_id {
+                let c = client.clone();
+                let t = token.access_token.clone();
+                let txc = tx.clone();
+                tokio::spawn(async move {
+                    let q = if folder_id == "shared_with_me" {
+                        "sharedWithMe = true and trashed = false".to_string()
+                    } else {
+                        format!("'{}' in parents and trashed = false", folder_id)
+                    };
+                    crate::drive::api::fetch_files(c.clone(), t.clone(), q, txc.clone()).await;
+                    crate::drive::api::fetch_quota(c, t, txc).await;
+                });
+            }
+        }
+        Action::ClearClipboard => {
+            app.clipboard = None;
         }
     }
 }

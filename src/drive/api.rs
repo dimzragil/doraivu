@@ -1,7 +1,47 @@
 use crate::drive::models::{DriveFile, UploadStatus, UploadTask};
-use crate::tui::state::{Action, Event};
+use crate::tui::state::{Action, Clipboard, ClipboardAction, Event};
 use reqwest::Client;
 use tokio::sync::mpsc;
+
+/// Sends an HTTP request with automatic retry logic for transient network failures, 429 rate limits, and 5xx errors.
+pub async fn send_with_retry<F>(
+    build_req: F,
+    max_retries: usize,
+) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0;
+    loop {
+        let req = build_req();
+        match req.send().await {
+            Ok(res) => {
+                if (res.status().is_server_error() || res.status().as_u16() == 429)
+                    && attempt < max_retries
+                {
+                    attempt += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        500 * (1 << (attempt - 1)),
+                    ))
+                    .await;
+                    continue;
+                }
+                return Ok(res);
+            }
+            Err(e) => {
+                if attempt < max_retries {
+                    attempt += 1;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        500 * (1 << (attempt - 1)),
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
 
 /// Fetches files from Google Drive matching the query
 pub async fn fetch_files(
@@ -15,7 +55,7 @@ pub async fn fetch_files(
         urlencoding::encode(&query)
     );
 
-    match client.get(&url).bearer_auth(&access_token).send().await {
+    match send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await {
         Ok(res) => {
             if res.status().is_success() {
                 #[derive(serde::Deserialize)]
@@ -57,12 +97,16 @@ pub async fn trash_file(
     tx: mpsc::Sender<Event>,
 ) {
     let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
-    match client
-        .patch(&url)
-        .bearer_auth(&access_token)
-        .json(&serde_json::json!({"trashed": true}))
-        .send()
-        .await
+    match send_with_retry(
+        || {
+            client
+                .patch(&url)
+                .bearer_auth(&access_token)
+                .json(&serde_json::json!({"trashed": true}))
+        },
+        3,
+    )
+    .await
     {
         Ok(res) if res.status().is_success() => {
             let _ = tx
@@ -85,10 +129,54 @@ pub async fn trash_file(
     }
 }
 
+/// Renames a Google Drive file or folder, then notifies the UI to refresh its list.
+pub async fn rename_file(
+    client: Client,
+    access_token: String,
+    file_id: String,
+    new_name: String,
+    tx: mpsc::Sender<Event>,
+) {
+    let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
+    match send_with_retry(
+        || {
+            client
+                .patch(&url)
+                .bearer_auth(&access_token)
+                .json(&serde_json::json!({"name": new_name}))
+        },
+        3,
+    )
+    .await
+    {
+        Ok(res) if res.status().is_success() => {
+            let _ = tx.send(Event::Action(Action::RenameSuccess)).await;
+        }
+        Ok(res) => {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            let _ = tx
+                .send(Event::Action(Action::Error(format!(
+                    "Rename failed ({}): {}",
+                    status, body
+                ))))
+                .await;
+        }
+        Err(e) => {
+            let _ = tx
+                .send(Event::Action(Action::Error(format!(
+                    "Rename failed: {}",
+                    e
+                ))))
+                .await;
+        }
+    }
+}
+
 /// Fetches storage quota information
 pub async fn fetch_quota(client: Client, access_token: String, tx: mpsc::Sender<Event>) {
     let url = "https://www.googleapis.com/drive/v3/about?fields=storageQuota";
-    match client.get(url).bearer_auth(&access_token).send().await {
+    match send_with_retry(|| client.get(url).bearer_auth(&access_token), 3).await {
         Ok(res) if res.status().is_success() => {
             #[derive(serde::Deserialize)]
             #[allow(non_snake_case)]
@@ -125,7 +213,7 @@ pub async fn fetch_preview(
         "https://www.googleapis.com/drive/v3/files/{}?alt=media",
         file_id
     );
-    match client.get(&url).bearer_auth(&access_token).send().await {
+    match send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await {
         Ok(res) if res.status().is_success() => {
             if let Ok(bytes) = res.bytes().await {
                 let _ = tx
@@ -234,7 +322,7 @@ async fn resolve_or_create_path(
                 urlencoding::encode(&query)
             );
 
-            let res = client.get(&url).bearer_auth(access_token).send().await?;
+            let res = send_with_retry(|| client.get(&url).bearer_auth(access_token), 3).await?;
             if !res.status().is_success() {
                 anyhow::bail!("Failed to query shared folder '{}'", shared_folder);
             }
@@ -276,7 +364,7 @@ async fn resolve_or_create_path(
             urlencoding::encode(&query)
         );
 
-        let res = client.get(&url).bearer_auth(access_token).send().await?;
+        let res = send_with_retry(|| client.get(&url).bearer_auth(access_token), 3).await?;
         if !res.status().is_success() {
             anyhow::bail!("API error resolving folder '{}'", part);
         }
@@ -304,12 +392,16 @@ async fn resolve_or_create_path(
             "parents": [current_id]
         });
 
-        let res = client
-            .post("https://www.googleapis.com/drive/v3/files")
-            .bearer_auth(access_token)
-            .json(&metadata)
-            .send()
-            .await?;
+        let res = send_with_retry(
+            || {
+                client
+                    .post("https://www.googleapis.com/drive/v3/files")
+                    .bearer_auth(access_token)
+                    .json(&metadata)
+            },
+            3,
+        )
+        .await?;
 
         if !res.status().is_success() {
             anyhow::bail!("Failed to create folder '{}'", part);
@@ -356,7 +448,6 @@ pub async fn upload_file(
 
     if metadata.is_dir() {
         let mut queue = vec![(std::path::PathBuf::from(&local_path), parent_id)];
-        let _count = 0;
 
         while let Some((current_dir, current_parent_id)) = queue.pop() {
             let mut entries = match tokio::fs::read_dir(&current_dir).await {
@@ -386,7 +477,8 @@ pub async fn upload_file(
                         urlencoding::encode(&query)
                     );
 
-                    let res = client.get(&url).bearer_auth(&access_token).send().await;
+                    let res =
+                        send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await;
                     let mut new_id = None;
                     if let Ok(r) = res {
                         if r.status().is_success() {
@@ -410,12 +502,16 @@ pub async fn upload_file(
                             "mimeType": "application/vnd.google-apps.folder",
                             "parents": [current_parent_id]
                         });
-                        let res = client
-                            .post("https://www.googleapis.com/drive/v3/files")
-                            .bearer_auth(&access_token)
-                            .json(&meta)
-                            .send()
-                            .await;
+                        let res = send_with_retry(
+                            || {
+                                client
+                                    .post("https://www.googleapis.com/drive/v3/files")
+                                    .bearer_auth(&access_token)
+                                    .json(&meta)
+                            },
+                            3,
+                        )
+                        .await;
 
                         match res {
                             Ok(r) if r.status().is_success() => {
@@ -481,7 +577,7 @@ pub async fn fetch_metadata(
         "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,mimeType,size,createdTime,modifiedTime,appProperties",
         file_id
     );
-    match client.get(&url).bearer_auth(&access_token).send().await {
+    match send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await {
         Ok(res) if res.status().is_success() => {
             #[derive(serde::Deserialize)]
             struct MetadataResponse {
@@ -520,12 +616,11 @@ pub async fn update_resume_time(
         }
     });
 
-    let res = client
-        .patch(&url)
-        .bearer_auth(&access_token)
-        .json(&payload)
-        .send()
-        .await?;
+    let res = send_with_retry(
+        || client.patch(&url).bearer_auth(&access_token).json(&payload),
+        3,
+    )
+    .await?;
 
     if !res.status().is_success() {
         let status = res.status();
@@ -534,6 +629,191 @@ pub async fn update_resume_time(
     }
 
     Ok(())
+}
+
+/// Copies or moves files in the clipboard to target_folder_id sequentially,
+/// then triggers folder refresh and clears the clipboard.
+pub async fn process_paste(
+    client: Client,
+    access_token: String,
+    clipboard: Clipboard,
+    target_folder_id: String,
+    tx: mpsc::Sender<Event>,
+) {
+    let total = clipboard.file_ids.len();
+    let mut success_count = 0;
+    let mut error_count = 0;
+
+    for (i, file_id) in clipboard.file_ids.iter().enumerate() {
+        let action_verb = match clipboard.action {
+            ClipboardAction::Copy => "Copying",
+            ClipboardAction::Move => "Moving",
+        };
+        let _ = tx
+            .send(Event::Action(Action::Message(format!(
+                "{} ({}/{})...",
+                action_verb,
+                i + 1,
+                total
+            ))))
+            .await;
+
+        let res = match clipboard.action {
+            ClipboardAction::Copy => {
+                let url = format!("https://www.googleapis.com/drive/v3/files/{}/copy", file_id);
+                let payload = serde_json::json!({
+                    "parents": [target_folder_id]
+                });
+                send_with_retry(
+                    || client.post(&url).bearer_auth(&access_token).json(&payload),
+                    3,
+                )
+                .await
+            }
+            ClipboardAction::Move => {
+                let url = if clipboard.source_parent_id.is_empty()
+                    || clipboard.source_parent_id == "shared_with_me"
+                    || clipboard.source_parent_id == "virtual_root"
+                {
+                    format!(
+                        "https://www.googleapis.com/drive/v3/files/{}?addParents={}",
+                        file_id,
+                        urlencoding::encode(&target_folder_id)
+                    )
+                } else {
+                    format!(
+                        "https://www.googleapis.com/drive/v3/files/{}?addParents={}&removeParents={}",
+                        file_id,
+                        urlencoding::encode(&target_folder_id),
+                        urlencoding::encode(&clipboard.source_parent_id)
+                    )
+                };
+                send_with_retry(
+                    || {
+                        client
+                            .patch(&url)
+                            .bearer_auth(&access_token)
+                            .json(&serde_json::json!({}))
+                    },
+                    3,
+                )
+                .await
+            }
+        };
+
+        match res {
+            Ok(r) if r.status().is_success() => {
+                success_count += 1;
+            }
+            Ok(r) => {
+                error_count += 1;
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                let _ = tx
+                    .send(Event::Action(Action::Error(format!(
+                        "Paste error on item {}: {} - {}",
+                        file_id, status, body
+                    ))))
+                    .await;
+            }
+            Err(e) => {
+                error_count += 1;
+                let _ = tx
+                    .send(Event::Action(Action::Error(format!(
+                        "Paste network error on item {}: {}",
+                        file_id, e
+                    ))))
+                    .await;
+            }
+        }
+    }
+
+    let final_msg = match clipboard.action {
+        ClipboardAction::Copy => {
+            if error_count == 0 {
+                format!("Successfully copied {} item(s).", success_count)
+            } else {
+                format!(
+                    "Copy complete: {} succeeded, {} failed.",
+                    success_count, error_count
+                )
+            }
+        }
+        ClipboardAction::Move => {
+            if error_count == 0 {
+                format!("Successfully moved {} item(s).", success_count)
+            } else {
+                format!(
+                    "Move complete: {} succeeded, {} failed.",
+                    success_count, error_count
+                )
+            }
+        }
+    };
+
+    let _ = tx.send(Event::Action(Action::Message(final_msg))).await;
+    let _ = tx.send(Event::Action(Action::ClearClipboard)).await;
+    let _ = tx
+        .send(Event::Action(Action::RefreshFolder(target_folder_id)))
+        .await;
+}
+
+/// Creates a new folder in Google Drive and sends a RefreshFolder action to update the UI.
+pub async fn create_folder(
+    client: Client,
+    access_token: String,
+    name: String,
+    parent_id: String,
+    tx: mpsc::Sender<Event>,
+) {
+    let url = "https://www.googleapis.com/drive/v3/files";
+    let target_parent = if parent_id == "virtual_root" {
+        "root".to_string()
+    } else {
+        parent_id
+    };
+    let payload = serde_json::json!({
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [&target_parent]
+    });
+
+    match send_with_retry(
+        || client.post(url).bearer_auth(&access_token).json(&payload),
+        3,
+    )
+    .await
+    {
+        Ok(res) if res.status().is_success() => {
+            let _ = tx
+                .send(Event::Action(Action::Message(format!(
+                    "Folder '{}' created.",
+                    name
+                ))))
+                .await;
+            let _ = tx
+                .send(Event::Action(Action::RefreshFolder(target_parent)))
+                .await;
+        }
+        Ok(res) => {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            let _ = tx
+                .send(Event::Action(Action::Error(format!(
+                    "Create folder failed ({}): {}",
+                    status, body
+                ))))
+                .await;
+        }
+        Err(e) => {
+            let _ = tx
+                .send(Event::Action(Action::Error(format!(
+                    "Create folder network error: {}",
+                    e
+                ))))
+                .await;
+        }
+    }
 }
 
 pub fn format_time(rfc3339: &str) -> String {

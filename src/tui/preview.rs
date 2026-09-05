@@ -10,18 +10,18 @@ use std::io::Stdout;
 use tokio::sync::mpsc;
 
 pub fn trigger_preview(app: &mut App, client: &Client, token: &str, tx: &mpsc::Sender<Event>) {
-    if app.preview_mode == PreviewMode::Hidden {
+    if app.preview.mode == PreviewMode::Hidden {
         return;
     }
-    app.preview_state = PreviewState::Loading;
-    app.preview_dims = None;
+    app.preview.state = PreviewState::Loading;
+    app.preview.dims = None;
     if let Some(file) = app.selected_file() {
         let c = client.clone();
         let t = token.to_string();
         let fid = file.id.clone();
         let txc = tx.clone();
 
-        if file.mime_type.starts_with("image/") && app.preview_mode == PreviewMode::Default {
+        if file.mime_type.starts_with("image/") && app.preview.mode == PreviewMode::Default {
             tokio::spawn(async move {
                 crate::drive::api::fetch_preview(c, t, fid, txc).await;
             });
@@ -30,7 +30,7 @@ pub fn trigger_preview(app: &mut App, client: &Client, token: &str, tx: &mpsc::S
                 crate::drive::api::fetch_metadata(c, t, fid, txc).await;
             });
         } else {
-            app.preview_state = PreviewState::None;
+            app.preview.state = PreviewState::None;
         }
     }
 }
@@ -138,8 +138,6 @@ pub async fn handle_suspend_and_edit(
             let bytes = res.bytes().await?;
             tokio::fs::write(&tmp_path, &bytes).await?;
 
-            let before_metadata = tokio::fs::metadata(&tmp_path).await?;
-
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
             println!("Opening {} with {}...", file.name, editor);
 
@@ -153,31 +151,29 @@ pub async fn handle_suspend_and_edit(
 
             match status {
                 Ok(exit_status) if exit_status.success() => {
-                    if let Ok(after_metadata) = tokio::fs::metadata(&tmp_path).await {
-                        if after_metadata.modified()? > before_metadata.modified()? {
-                            println!("File changed, uploading...");
+                    let new_content = tokio::fs::read(&tmp_path).await?;
+                    if new_content != bytes.as_ref() {
+                        println!("File changed, uploading...");
 
-                            let new_content = tokio::fs::read(&tmp_path).await?;
-                            let upload_url = format!(
-                                "https://www.googleapis.com/upload/drive/v3/files/{}?uploadType=media",
-                                file.id
-                            );
-                            let patch_res = client
-                                .patch(&upload_url)
-                                .bearer_auth(&token.access_token)
-                                .header("Content-Type", &file.mime_type)
-                                .body(new_content)
-                                .send()
-                                .await?;
+                        let upload_url = format!(
+                            "https://www.googleapis.com/upload/drive/v3/files/{}?uploadType=media",
+                            file.id
+                        );
+                        let patch_res = client
+                            .patch(&upload_url)
+                            .bearer_auth(&token.access_token)
+                            .header("Content-Type", &file.mime_type)
+                            .body(new_content)
+                            .send()
+                            .await?;
 
-                            if patch_res.status().is_success() {
-                                app.status = format!("Successfully updated {}", file.name);
-                            } else {
-                                app.status = format!("Upload failed: {}", patch_res.status());
-                            }
+                        if patch_res.status().is_success() {
+                            app.status = format!("Successfully updated {}", file.name);
                         } else {
-                            app.status = "No changes made.".into();
+                            app.status = format!("Upload failed: {}", patch_res.status());
                         }
+                    } else {
+                        app.status = "No changes made.".into();
                     }
                 }
                 Ok(_) => {

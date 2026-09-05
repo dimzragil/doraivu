@@ -240,7 +240,6 @@ pub async fn refresh_token_if_needed(
         // Keep the old refresh_token
 
         save_token(token)?;
-        println!("Token successfully refreshed.");
         Ok(())
     } else {
         let body = res.text().await?;

@@ -1,4 +1,4 @@
-use crate::drive::api::{fetch_files, fetch_quota, upload_file};
+use crate::drive::api::{create_folder, fetch_files, fetch_quota, rename_file, upload_file};
 use crate::drive::models::{self, DriveFile};
 use crate::drive::{auth, trash, upload};
 use crate::tui::preview::{is_editable_text, trigger_preview};
@@ -38,13 +38,121 @@ pub fn handle_input(
         state::InputMode::UploadModal => {
             handle_upload_modal_keys(app, key, client, token, tx);
         }
+        state::InputMode::RenameModal => {
+            handle_rename_modal_keys(app, key, client, token, tx);
+        }
+        state::InputMode::NewFolderModal => {
+            handle_new_folder_modal_keys(app, key, client, token, tx);
+        }
         state::InputMode::Normal => {
-            if app.search_mode {
+            if app.search.active {
                 handle_search_keys(app, key, client, token, tx);
             } else {
                 handle_normal_keys(app, key, client, token, tx);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rename Modal Handler
+// ---------------------------------------------------------------------------
+
+fn handle_rename_modal_keys(
+    app: &mut App,
+    key: KeyEvent,
+    client: &Client,
+    token: &auth::Token,
+    tx: &mpsc::Sender<Event>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            app.rename.buffer.clear();
+            app.rename.target_id.clear();
+            app.input_mode = state::InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            app.rename.buffer.pop();
+        }
+        KeyCode::Enter => {
+            let file_id = std::mem::take(&mut app.rename.target_id);
+            let new_name = std::mem::take(&mut app.rename.buffer);
+            app.input_mode = state::InputMode::Normal;
+
+            if file_id.is_empty() {
+                return;
+            }
+
+            app.status = format!("Renaming {}...", new_name);
+            let c = client.clone();
+            let t = token.access_token.clone();
+            let txc = tx.clone();
+            tokio::spawn(async move {
+                rename_file(c, t, file_id, new_name, txc).await;
+            });
+        }
+        KeyCode::Char(c) => {
+            app.rename.buffer.push(c);
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New Folder Modal Handler
+// ---------------------------------------------------------------------------
+
+fn handle_new_folder_modal_keys(
+    app: &mut App,
+    key: KeyEvent,
+    client: &Client,
+    token: &auth::Token,
+    tx: &mpsc::Sender<Event>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            app.new_folder_buffer.clear();
+            app.input_mode = state::InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            app.new_folder_buffer.pop();
+        }
+        KeyCode::Enter => {
+            let folder_name = std::mem::take(&mut app.new_folder_buffer)
+                .trim()
+                .to_string();
+            app.input_mode = state::InputMode::Normal;
+
+            if folder_name.is_empty() {
+                app.status = "Folder creation cancelled: name cannot be empty.".into();
+                return;
+            }
+
+            if app.current_folder_id() == "shared_with_me" {
+                app.status =
+                    "Cannot create folder in 'Shared with me'. Please open a subfolder first."
+                        .into();
+                return;
+            }
+
+            let parent_id = if app.current_folder_id() == "virtual_root" {
+                "root".to_string()
+            } else {
+                app.current_folder_id().to_string()
+            };
+
+            app.status = format!("Creating folder '{}'...", folder_name);
+            let c = client.clone();
+            let t = token.access_token.clone();
+            let txc = tx.clone();
+            tokio::spawn(async move {
+                create_folder(c, t, folder_name, parent_id, txc).await;
+            });
+        }
+        KeyCode::Char(c) => {
+            app.new_folder_buffer.push(c);
+        }
+        _ => {}
     }
 }
 
@@ -64,32 +172,32 @@ fn handle_trash_view_keys(
             app.input_mode = state::InputMode::Normal;
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if !app.trashed_files.is_empty() {
-                let i = match app.trash_state.selected() {
+            if !app.trash.files.is_empty() {
+                let i = match app.trash.state.selected() {
                     Some(i) => {
-                        if i >= app.trashed_files.len() - 1 {
-                            app.trashed_files.len() - 1
+                        if i >= app.trash.files.len() - 1 {
+                            app.trash.files.len() - 1
                         } else {
                             i + 1
                         }
                     }
                     None => 0,
                 };
-                app.trash_state.select(Some(i));
+                app.trash.state.select(Some(i));
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if !app.trashed_files.is_empty() {
-                let i = match app.trash_state.selected() {
+            if !app.trash.files.is_empty() {
+                let i = match app.trash.state.selected() {
                     Some(i) => i.saturating_sub(1),
                     None => 0,
                 };
-                app.trash_state.select(Some(i));
+                app.trash.state.select(Some(i));
             }
         }
         KeyCode::Char('r') => {
-            if let Some(i) = app.trash_state.selected() {
-                if let Some(file) = app.trashed_files.get(i).cloned() {
+            if let Some(i) = app.trash.state.selected() {
+                if let Some(file) = app.trash.files.get(i).cloned() {
                     app.status = format!("Restoring {}...", file.name);
                     let c = client.clone();
                     let t = token.access_token.clone();
@@ -101,11 +209,11 @@ fn handle_trash_view_keys(
             }
         }
         KeyCode::Char('x') | KeyCode::Delete => {
-            if app.trash_state.selected().is_some() {
+            if app.trash.state.selected().is_some() {
                 app.input_mode = state::InputMode::TrashDeleteConfirmModal;
             }
         }
-        KeyCode::Char('X') if !app.trashed_files.is_empty() => {
+        KeyCode::Char('X') if !app.trash.files.is_empty() => {
             app.input_mode = state::InputMode::TrashDeleteAllConfirmModal;
         }
         _ => {}
@@ -121,8 +229,8 @@ fn handle_trash_delete_confirm_keys(
 ) {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-            if let Some(i) = app.trash_state.selected() {
-                if let Some(file) = app.trashed_files.get(i).cloned() {
+            if let Some(i) = app.trash.state.selected() {
+                if let Some(file) = app.trash.files.get(i).cloned() {
                     app.status = format!("Deleting permanently {}...", file.name);
                     let c = client.clone();
                     let t = token.access_token.clone();
@@ -154,7 +262,7 @@ fn handle_trash_empty_confirm_keys(
             let c = client.clone();
             let t = token.access_token.clone();
             let txc = tx.clone();
-            let files = app.trashed_files.clone();
+            let files = app.trash.files.clone();
             tokio::spawn(async move {
                 trash::empty_trash(c, t, files, txc).await;
             });
@@ -265,9 +373,9 @@ fn handle_upload_tracker_keys(
             app.input_mode = state::InputMode::Normal;
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            let i = match app.ul_manager.state.selected() {
+            let i = match app.upload.manager.state.selected() {
                 Some(i) => {
-                    if i >= app.ul_manager.queue.len().saturating_sub(1) {
+                    if i >= app.upload.manager.queue.len().saturating_sub(1) {
                         i
                     } else {
                         i + 1
@@ -275,10 +383,10 @@ fn handle_upload_tracker_keys(
                 }
                 None => 0,
             };
-            app.ul_manager.state.select(Some(i));
+            app.upload.manager.state.select(Some(i));
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            let i = match app.ul_manager.state.selected() {
+            let i = match app.upload.manager.state.selected() {
                 Some(i) => {
                     if i == 0 {
                         0
@@ -288,28 +396,32 @@ fn handle_upload_tracker_keys(
                 }
                 None => 0,
             };
-            app.ul_manager.state.select(Some(i));
+            app.upload.manager.state.select(Some(i));
         }
         KeyCode::Char('x') | KeyCode::Delete => {
-            if let Some(i) = app.ul_manager.state.selected() {
-                if i < app.ul_manager.queue.len() {
-                    let task = &app.ul_manager.queue[i];
-                    if task.status == models::UploadStatus::Uploading {
-                        if let Some(handle) = app.active_ul_task.take() {
+            if let Some(i) = app.upload.manager.state.selected() {
+                if i < app.upload.manager.queue.len() {
+                    let task = &app.upload.manager.queue[i];
+                    if task.status == models::UploadStatus::Uploading
+                        || task.status == models::UploadStatus::Reconnecting
+                    {
+                        if let Some(handle) = app.upload.active_task.take() {
                             handle.abort();
                         }
                     }
-                    app.ul_manager.queue.remove(i);
-                    if app.ul_manager.queue.is_empty() {
-                        app.ul_manager.state.select(None);
+                    app.upload.manager.queue.remove(i);
+                    if app.upload.manager.queue.is_empty() {
+                        app.upload.manager.state.select(None);
                     } else {
-                        app.ul_manager
+                        app.upload
+                            .manager
                             .state
-                            .select(Some(i.min(app.ul_manager.queue.len() - 1)));
+                            .select(Some(i.min(app.upload.manager.queue.len() - 1)));
                     }
 
                     if let Some(first) = app
-                        .ul_manager
+                        .upload
+                        .manager
                         .queue
                         .iter_mut()
                         .find(|t| t.status == models::UploadStatus::Pending)
@@ -319,7 +431,7 @@ fn handle_upload_tracker_keys(
                         let client_c = client.clone();
                         let token_c = token.access_token.clone();
                         let tx_c = tx.clone();
-                        app.active_ul_task = Some(tokio::spawn(async move {
+                        app.upload.active_task = Some(tokio::spawn(async move {
                             upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                         }));
                     }
@@ -327,17 +439,19 @@ fn handle_upload_tracker_keys(
             }
         }
         KeyCode::Char('p') => {
-            if let Some(i) = app.ul_manager.state.selected() {
-                if i < app.ul_manager.queue.len()
-                    && app.ul_manager.queue[i].status == models::UploadStatus::Uploading
+            if let Some(i) = app.upload.manager.state.selected() {
+                if i < app.upload.manager.queue.len()
+                    && (app.upload.manager.queue[i].status == models::UploadStatus::Uploading
+                        || app.upload.manager.queue[i].status == models::UploadStatus::Reconnecting)
                 {
-                    app.ul_manager.queue[i].status = models::UploadStatus::Paused;
-                    if let Some(handle) = app.active_ul_task.take() {
+                    app.upload.manager.queue[i].status = models::UploadStatus::Paused;
+                    if let Some(handle) = app.upload.active_task.take() {
                         handle.abort();
                     }
 
                     if let Some(first) = app
-                        .ul_manager
+                        .upload
+                        .manager
                         .queue
                         .iter_mut()
                         .find(|t| t.status == models::UploadStatus::Pending)
@@ -347,7 +461,7 @@ fn handle_upload_tracker_keys(
                         let client_c = client.clone();
                         let token_c = token.access_token.clone();
                         let tx_c = tx.clone();
-                        app.active_ul_task = Some(tokio::spawn(async move {
+                        app.upload.active_task = Some(tokio::spawn(async move {
                             upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                         }));
                     }
@@ -355,14 +469,15 @@ fn handle_upload_tracker_keys(
             }
         }
         KeyCode::Char('r') => {
-            if let Some(i) = app.ul_manager.state.selected() {
-                if i < app.ul_manager.queue.len()
-                    && app.ul_manager.queue[i].status == models::UploadStatus::Paused
+            if let Some(i) = app.upload.manager.state.selected() {
+                if i < app.upload.manager.queue.len()
+                    && app.upload.manager.queue[i].status == models::UploadStatus::Paused
                 {
-                    app.ul_manager.queue[i].status = models::UploadStatus::Pending;
-                    if app.active_ul_task.is_none() {
+                    app.upload.manager.queue[i].status = models::UploadStatus::Pending;
+                    if app.upload.active_task.is_none() {
                         if let Some(first) = app
-                            .ul_manager
+                            .upload
+                            .manager
                             .queue
                             .iter_mut()
                             .find(|t| t.status == models::UploadStatus::Pending)
@@ -372,7 +487,7 @@ fn handle_upload_tracker_keys(
                             let client_c = client.clone();
                             let token_c = token.access_token.clone();
                             let tx_c = tx.clone();
-                            app.active_ul_task = Some(tokio::spawn(async move {
+                            app.upload.active_task = Some(tokio::spawn(async move {
                                 upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                             }));
                         }
@@ -396,43 +511,46 @@ fn handle_download_tracker_keys(
             app.input_mode = state::InputMode::Normal;
         }
         KeyCode::Char('j') | KeyCode::Down => {
-            if !app.dl_manager.queue.is_empty() {
-                let i = match app.dl_manager.state.selected() {
+            if !app.download.manager.queue.is_empty() {
+                let i = match app.download.manager.state.selected() {
                     Some(i) => {
-                        if i >= app.dl_manager.queue.len() - 1 {
-                            app.dl_manager.queue.len() - 1
+                        if i >= app.download.manager.queue.len() - 1 {
+                            app.download.manager.queue.len() - 1
                         } else {
                             i + 1
                         }
                     }
                     None => 0,
                 };
-                app.dl_manager.state.select(Some(i));
+                app.download.manager.state.select(Some(i));
             }
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            if !app.dl_manager.queue.is_empty() {
-                let i = match app.dl_manager.state.selected() {
+            if !app.download.manager.queue.is_empty() {
+                let i = match app.download.manager.state.selected() {
                     Some(i) => i.saturating_sub(1),
                     None => 0,
                 };
-                app.dl_manager.state.select(Some(i));
+                app.download.manager.state.select(Some(i));
             }
         }
         KeyCode::Char('x') | KeyCode::Delete => {
-            if let Some(i) = app.dl_manager.state.selected() {
-                if i < app.dl_manager.queue.len() {
-                    let item = &app.dl_manager.queue[i];
-                    if item.status == models::DownloadStatus::Downloading {
-                        if let Some(task) = app.active_dl_task.take() {
+            if let Some(i) = app.download.manager.state.selected() {
+                if i < app.download.manager.queue.len() {
+                    let item = &app.download.manager.queue[i];
+                    if item.status == models::DownloadStatus::Downloading
+                        || item.status == models::DownloadStatus::Reconnecting
+                    {
+                        if let Some(task) = app.download.active_task.take() {
                             task.abort();
                         }
                     }
-                    app.dl_manager.queue.remove(i);
+                    app.download.manager.queue.remove(i);
 
-                    if app.active_dl_task.is_none() {
+                    if app.download.active_task.is_none() {
                         if let Some(first) = app
-                            .dl_manager
+                            .download
+                            .manager
                             .queue
                             .iter_mut()
                             .find(|t| t.status != models::DownloadStatus::Paused)
@@ -443,7 +561,7 @@ fn handle_download_tracker_keys(
                             let txc = tx.clone();
                             let f = first.file.clone();
                             let start_bytes = first.downloaded_bytes;
-                            app.active_dl_task = Some(tokio::spawn(async move {
+                            app.download.active_task = Some(tokio::spawn(async move {
                                 crate::drive::download::download_file_ranged(
                                     c,
                                     t,
@@ -459,17 +577,20 @@ fn handle_download_tracker_keys(
             }
         }
         KeyCode::Char('p') => {
-            if let Some(i) = app.dl_manager.state.selected() {
-                if let Some(item) = app.dl_manager.queue.get_mut(i) {
-                    if item.status == models::DownloadStatus::Downloading {
+            if let Some(i) = app.download.manager.state.selected() {
+                if let Some(item) = app.download.manager.queue.get_mut(i) {
+                    if item.status == models::DownloadStatus::Downloading
+                        || item.status == models::DownloadStatus::Reconnecting
+                    {
                         item.status = models::DownloadStatus::Paused;
-                        if let Some(task) = app.active_dl_task.take() {
+                        if let Some(task) = app.download.active_task.take() {
                             task.abort();
                         }
                         app.status = "Download paused.".into();
 
                         if let Some(first) = app
-                            .dl_manager
+                            .download
+                            .manager
                             .queue
                             .iter_mut()
                             .find(|t| t.status == models::DownloadStatus::Pending)
@@ -480,7 +601,7 @@ fn handle_download_tracker_keys(
                             let txc = tx.clone();
                             let f = first.file.clone();
                             let start_bytes = first.downloaded_bytes;
-                            app.active_dl_task = Some(tokio::spawn(async move {
+                            app.download.active_task = Some(tokio::spawn(async move {
                                 crate::drive::download::download_file_ranged(
                                     c,
                                     t,
@@ -496,20 +617,20 @@ fn handle_download_tracker_keys(
             }
         }
         KeyCode::Char('r') => {
-            if let Some(i) = app.dl_manager.state.selected() {
-                if let Some(item) = app.dl_manager.queue.get_mut(i) {
+            if let Some(i) = app.download.manager.state.selected() {
+                if let Some(item) = app.download.manager.queue.get_mut(i) {
                     if item.status == models::DownloadStatus::Paused {
                         item.status = models::DownloadStatus::Pending;
                         app.status = "Download queued for resume.".into();
 
-                        if app.active_dl_task.is_none() {
+                        if app.download.active_task.is_none() {
                             item.status = models::DownloadStatus::Downloading;
                             let c = client.clone();
                             let t = token.access_token.clone();
                             let txc = tx.clone();
                             let f = item.file.clone();
                             let start_bytes = item.downloaded_bytes;
-                            app.active_dl_task = Some(tokio::spawn(async move {
+                            app.download.active_task = Some(tokio::spawn(async move {
                                 crate::drive::download::download_file_ranged(
                                     c,
                                     t,
@@ -544,16 +665,16 @@ fn handle_upload_modal_keys(
             app.input_mode = state::InputMode::Normal;
         }
         KeyCode::Tab => {
-            app.upload_input_idx = (app.upload_input_idx + 1) % 2;
+            app.upload.input_idx = (app.upload.input_idx + 1) % 2;
         }
         KeyCode::Enter => {
-            let path_str = if app.path_names.len() == 1 {
+            let path_str = if app.nav.path_names.len() == 1 {
                 "/".to_string()
             } else {
-                format!("/{}", app.path_names[1..].join("/"))
+                format!("/{}", app.nav.path_names[1..].join("/"))
             };
 
-            if app.current_path == "shared_with_me" && app.upload_target_id == path_str {
+            if app.nav.current_path == "shared_with_me" && app.upload.target_id == path_str {
                 app.status =
                     "Cannot upload directly to 'Shared with me' root. Please open a shared folder first."
                         .into();
@@ -561,26 +682,26 @@ fn handle_upload_modal_keys(
                 return;
             }
 
-            let parent = if app.upload_target_id == path_str {
-                if app.current_path == "virtual_root" {
+            let parent = if app.upload.target_id == path_str {
+                if app.nav.current_path == "virtual_root" {
                     "root".to_string()
                 } else {
-                    app.current_path.clone()
+                    app.nav.current_path.clone()
                 }
             } else {
-                app.upload_target_id.clone()
+                app.upload.target_id.clone()
             };
 
-            let path = app.upload_local_path.trim().to_string();
+            let path = app.upload.local_path.trim().to_string();
             if path.is_empty() {
                 app.status = "Local path cannot be empty.".into();
                 app.input_mode = state::InputMode::Normal;
                 return;
             }
 
-            app.upload_progress = Some((0, 0, 0.0));
+            app.upload.progress = Some((0, 0, 0.0));
             app.input_mode = state::InputMode::Normal;
-            app.upload_local_path.clear();
+            app.upload.local_path.clear();
             let c = client.clone();
             let t = token.access_token.clone();
             let txc = tx.clone();
@@ -589,17 +710,17 @@ fn handle_upload_modal_keys(
             });
         }
         KeyCode::Backspace => {
-            if app.upload_input_idx == 0 {
-                app.upload_target_id.pop();
+            if app.upload.input_idx == 0 {
+                app.upload.target_id.pop();
             } else {
-                app.upload_local_path.pop();
+                app.upload.local_path.pop();
             }
         }
         KeyCode::Char(c) => {
-            if app.upload_input_idx == 0 {
-                app.upload_target_id.push(c);
+            if app.upload.input_idx == 0 {
+                app.upload.target_id.push(c);
             } else {
-                app.upload_local_path.push(c);
+                app.upload.local_path.push(c);
             }
         }
         _ => {}
@@ -619,19 +740,19 @@ fn handle_search_keys(
 ) {
     match key.code {
         KeyCode::Esc | KeyCode::Enter => {
-            app.search_mode = false;
+            app.search.active = false;
         }
         KeyCode::Backspace => {
-            app.search_query.pop();
-            let sq = app.search_query.clone().replace('\'', "\\'");
+            app.search.query.pop();
+            let sq = app.search.query.clone().replace('\'', "\\'");
             if sq.is_empty() {
-                if app.current_path == "virtual_root" {
+                if app.nav.current_path == "virtual_root" {
                     app.files = DriveFile::virtual_root_items();
                 } else {
                     let c = client.clone();
                     let t = token.access_token.clone();
                     let txc = tx.clone();
-                    let current = app.current_path.clone();
+                    let current = app.nav.current_path.clone();
                     tokio::spawn(async move {
                         let q = if current == "shared_with_me" {
                             "sharedWithMe = true and trashed = false".to_string()
@@ -652,10 +773,10 @@ fn handle_search_keys(
             }
         }
         KeyCode::Char(c) => {
-            app.search_query.push(c);
+            app.search.query.push(c);
             let cl = client.clone();
             let t = token.access_token.clone();
-            let sq = app.search_query.clone().replace('\'', "\\'");
+            let sq = app.search.query.clone().replace('\'', "\\'");
             let txc = tx.clone();
             tokio::spawn(async move {
                 let q = format!("name contains '{}' and trashed = false", sq);
@@ -693,19 +814,19 @@ fn handle_normal_keys(
         KeyCode::Char('p') => {
             if let Some(file) = app.selected_file() {
                 if file.mime_type.starts_with("image/") {
-                    app.preview_mode = match app.preview_mode {
+                    app.preview.mode = match app.preview.mode {
                         state::PreviewMode::Hidden => state::PreviewMode::Default,
                         state::PreviewMode::Default => state::PreviewMode::ForceMetadata,
                         state::PreviewMode::ForceMetadata => state::PreviewMode::Hidden,
                     };
                 } else {
-                    app.preview_mode = match app.preview_mode {
+                    app.preview.mode = match app.preview.mode {
                         state::PreviewMode::Hidden => state::PreviewMode::Default,
                         _ => state::PreviewMode::Hidden,
                     };
                 }
             } else {
-                app.preview_mode = match app.preview_mode {
+                app.preview.mode = match app.preview.mode {
                     state::PreviewMode::Hidden => state::PreviewMode::Default,
                     _ => state::PreviewMode::Hidden,
                 };
@@ -719,7 +840,7 @@ fn handle_normal_keys(
             let c = client.clone();
             let t = token.access_token.clone();
             let txc = tx.clone();
-            let parent_id = app.current_path.clone();
+            let parent_id = app.nav.current_path.clone();
             if parent_id == "virtual_root" {
                 app.files = DriveFile::virtual_root_items();
                 app.status = "Virtual Root loaded.".to_string();
@@ -735,6 +856,23 @@ fn handle_normal_keys(
                 });
             }
         }
+        KeyCode::Char('n') => {
+            if app.current_folder_id() == "shared_with_me" {
+                app.status =
+                    "Cannot create folder in 'Shared with me'. Please open a subfolder first."
+                        .into();
+                return;
+            }
+            app.new_folder_buffer.clear();
+            app.input_mode = state::InputMode::NewFolderModal;
+        }
+        KeyCode::Char('c') => {
+            if let Some(file) = app.selected_file().cloned() {
+                app.rename.target_id = file.id;
+                app.rename.buffer = file.name;
+                app.input_mode = state::InputMode::RenameModal;
+            }
+        }
         KeyCode::Char('T') => {
             app.input_mode = state::InputMode::TrashView;
             app.status = "Loading trash...".into();
@@ -745,11 +883,109 @@ fn handle_normal_keys(
                 trash::fetch_trash(c, t, txc).await;
             });
         }
-        KeyCode::Char('/') => {
-            app.search_mode = true;
-            app.search_query.clear();
+        KeyCode::Char('y') => {
+            let file_ids: Vec<String> = if !app.selected_files.is_empty() {
+                app.selected_files.iter().cloned().collect()
+            } else if let Some(file) = app.selected_file() {
+                if file.id == "root" || file.id == "shared_with_me" {
+                    app.status = "Cannot copy virtual root items.".into();
+                    return;
+                }
+                vec![file.id.clone()]
+            } else {
+                Vec::new()
+            };
+
+            if !file_ids.is_empty() {
+                let count = file_ids.len();
+                app.clipboard = Some(state::Clipboard {
+                    action: state::ClipboardAction::Copy,
+                    file_ids,
+                    source_parent_id: app.current_folder_id().to_string(),
+                });
+                app.selected_files.clear();
+                app.status = format!(
+                    "Copied {} {}.",
+                    count,
+                    if count == 1 { "file" } else { "files" }
+                );
+            } else {
+                app.status = "No file selected to copy.".into();
+            }
         }
-        KeyCode::Char('v') | KeyCode::Char('m') => {
+        KeyCode::Char('m') => {
+            let file_ids: Vec<String> = if !app.selected_files.is_empty() {
+                app.selected_files.iter().cloned().collect()
+            } else if let Some(file) = app.selected_file() {
+                if file.id == "root" || file.id == "shared_with_me" {
+                    app.status = "Cannot move virtual root items.".into();
+                    return;
+                }
+                vec![file.id.clone()]
+            } else {
+                Vec::new()
+            };
+
+            if !file_ids.is_empty() {
+                let count = file_ids.len();
+                app.clipboard = Some(state::Clipboard {
+                    action: state::ClipboardAction::Move,
+                    file_ids,
+                    source_parent_id: app.current_folder_id().to_string(),
+                });
+                app.selected_files.clear();
+                app.status = format!(
+                    "Cut {} {}.",
+                    count,
+                    if count == 1 { "file" } else { "files" }
+                );
+            } else {
+                app.status = "No file selected to move.".into();
+            }
+        }
+        KeyCode::Char('P') => {
+            let target_folder_id = app.current_folder_id().to_string();
+            if target_folder_id == "virtual_root" {
+                app.status = "Cannot paste into virtual root. Please open a folder first.".into();
+                return;
+            }
+            if target_folder_id == "shared_with_me" {
+                app.status =
+                    "Cannot paste into 'Shared with me' root. Please open a subfolder first."
+                        .into();
+                return;
+            }
+            if let Some(clipboard) = app.clipboard.clone() {
+                if clipboard.action == state::ClipboardAction::Move
+                    && clipboard.source_parent_id == target_folder_id
+                {
+                    app.status = "Source and target folders are identical.".into();
+                    return;
+                }
+                let count = clipboard.file_ids.len();
+                let action_name = match clipboard.action {
+                    state::ClipboardAction::Copy => "Copying",
+                    state::ClipboardAction::Move => "Moving",
+                };
+                app.status = format!(
+                    "{} {} {}...",
+                    action_name,
+                    count,
+                    if count == 1 { "item" } else { "items" }
+                );
+
+                let c = client.clone();
+                let t = token.access_token.clone();
+                let txc = tx.clone();
+
+                tokio::spawn(async move {
+                    crate::drive::api::process_paste(c, t, clipboard, target_folder_id, txc).await;
+                });
+            } else {
+                app.status = "Clipboard is empty.".into();
+            }
+        }
+        KeyCode::Char('v') => {
             if let Some(file) = app.selected_file().cloned() {
                 if !file.mime_type.ends_with("folder") {
                     let resume_time = file
@@ -770,7 +1006,7 @@ fn handle_normal_keys(
                     let token_str = token.access_token.clone();
                     let client_c = client.clone();
                     let txc = tx.clone();
-                    let file_id = file.id.clone();
+                    let file_id = file.id;
 
                     tokio::spawn(async move {
                         let mut cmd = tokio::process::Command::new("mpv");
@@ -820,15 +1056,15 @@ fn handle_normal_keys(
         KeyCode::Enter | KeyCode::Char('l') => {
             if let Some(file) = app.selected_file().cloned() {
                 if file.mime_type == "application/vnd.google-apps.folder" {
-                    app.history.push(app.current_path.clone());
-                    app.path_names.push(file.name.clone());
-                    app.current_path = file.id.clone();
+                    app.nav.history.push(app.nav.current_path.clone());
+                    app.nav.path_names.push(file.name.clone());
+                    app.nav.current_path = file.id.clone();
                     app.status = format!("Loading folder: {}...", file.name);
                     app.files.clear();
 
                     let c = client.clone();
                     let t = token.access_token.clone();
-                    let fid = file.id.clone();
+                    let fid = file.id;
                     let txc = tx.clone();
 
                     tokio::spawn(async move {
@@ -845,9 +1081,9 @@ fn handle_normal_keys(
             }
         }
         KeyCode::Char('h') | KeyCode::Backspace => {
-            if let Some(parent_id) = app.history.pop() {
-                app.path_names.pop();
-                app.current_path = parent_id.clone();
+            if let Some(parent_id) = app.nav.history.pop() {
+                app.nav.path_names.pop();
+                app.nav.current_path = parent_id.clone();
                 app.status = "Going back...".into();
                 app.files.clear();
                 app.selected_files.clear();
@@ -894,16 +1130,16 @@ fn handle_normal_keys(
         }
         KeyCode::Char('u') => {
             app.input_mode = state::InputMode::UploadModal;
-            if app.path_names.len() == 1 {
-                app.upload_target_id = "/".to_string();
+            if app.nav.path_names.len() == 1 {
+                app.upload.target_id = "/".to_string();
             } else {
-                app.upload_target_id = format!("/{}", app.path_names[1..].join("/"));
+                app.upload.target_id = format!("/{}", app.nav.path_names[1..].join("/"));
             }
-            app.upload_input_idx = 1;
+            app.upload.input_idx = 1;
             let home = directories::UserDirs::new()
                 .map(|u| u.home_dir().to_string_lossy().to_string())
                 .unwrap_or_else(|| "/".to_string());
-            app.upload_local_path = if home.ends_with('/') {
+            app.upload.local_path = if home.ends_with('/') {
                 home
             } else {
                 format!("{}/", home)

@@ -37,6 +37,7 @@ pub enum UploadStatus {
     Pending,
     Uploading,
     Paused,
+    Reconnecting,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -76,6 +77,7 @@ pub enum DownloadStatus {
     Pending,
     Downloading,
     Paused,
+    Reconnecting,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

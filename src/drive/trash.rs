@@ -1,3 +1,4 @@
+use crate::drive::api::send_with_retry;
 use crate::drive::models::DriveFile;
 use crate::tui::state::{Action, Event};
 use reqwest::Client;
@@ -6,7 +7,7 @@ use tokio::sync::mpsc;
 pub async fn fetch_trash(client: Client, access_token: String, tx: mpsc::Sender<Event>) {
     let url =
         "https://www.googleapis.com/drive/v3/files?q=trashed=true&pageSize=1000&fields=files(id,name,mimeType,appProperties)";
-    match client.get(url).bearer_auth(&access_token).send().await {
+    match send_with_retry(|| client.get(url).bearer_auth(&access_token), 3).await {
         Ok(res) if res.status().is_success() => {
             #[derive(serde::Deserialize)]
             struct FilesResponse {
@@ -36,12 +37,11 @@ pub async fn restore_file(
 ) {
     let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
     let body = serde_json::json!({"trashed": false});
-    match client
-        .patch(&url)
-        .bearer_auth(&access_token)
-        .json(&body)
-        .send()
-        .await
+    match send_with_retry(
+        || client.patch(&url).bearer_auth(&access_token).json(&body),
+        3,
+    )
+    .await
     {
         Ok(res) if res.status().is_success() => {
             let _ = tx
@@ -65,14 +65,15 @@ pub async fn delete_permanently(
     tx: mpsc::Sender<Event>,
 ) {
     let url = format!("https://www.googleapis.com/drive/v3/files/{}", file_id);
-    match client.delete(&url).bearer_auth(&access_token).send().await {
+    match send_with_retry(|| client.delete(&url).bearer_auth(&access_token), 3).await {
         Ok(res) if res.status().is_success() || res.status().as_u16() == 204 => {
             let _ = tx
                 .send(Event::Action(Action::Message(
                     "File deleted permanently".into(),
                 )))
                 .await;
-            fetch_trash(client, access_token, tx).await;
+            fetch_trash(client.clone(), access_token.clone(), tx.clone()).await;
+            crate::drive::api::fetch_quota(client, access_token, tx).await;
         }
         _ => {
             let _ = tx
@@ -104,7 +105,8 @@ pub async fn empty_trash(
             ))))
             .await;
         let url = format!("https://www.googleapis.com/drive/v3/files/{}", file.id);
-        if let Ok(res) = client.delete(&url).bearer_auth(&access_token).send().await {
+        if let Ok(res) = send_with_retry(|| client.delete(&url).bearer_auth(&access_token), 3).await
+        {
             if res.status().is_success() || res.status().as_u16() == 204 {
                 success_count += 1;
             }
@@ -117,5 +119,6 @@ pub async fn empty_trash(
             success_count
         ))))
         .await;
-    fetch_trash(client, access_token, tx).await;
+    fetch_trash(client.clone(), access_token.clone(), tx.clone()).await;
+    crate::drive::api::fetch_quota(client, access_token, tx).await;
 }

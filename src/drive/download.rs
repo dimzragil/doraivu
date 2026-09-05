@@ -1,6 +1,7 @@
 use crate::drive::models::DriveFile;
 use crate::tui::state::{Action, Event};
 use reqwest::Client;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 pub async fn download_file_ranged(
@@ -14,95 +15,218 @@ pub async fn download_file_ranged(
         "https://www.googleapis.com/drive/v3/files/{}?alt=media",
         file.id
     );
-    let mut req = client.get(&url).bearer_auth(&access_token);
 
-    if start_bytes > 0 {
-        req = req.header("Range", format!("bytes={}-", start_bytes));
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let downloads_dir = format!("{}/Downloads", home);
+    let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+    let dest_path = format!("{}/{}", downloads_dir, file.name);
+
+    let mut total_size: Option<u64> = None;
+    let mut attempt = 0;
+    let backoff_delays = [3, 5, 10, 10, 10];
+    let max_retries = backoff_delays.len();
+
+    // If starting from 0 initially, truncate any existing file
+    if start_bytes == 0 {
+        let _ = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&dest_path)
+            .await;
     }
 
-    match req.send().await {
-        Ok(res) if res.status().is_success() || res.status().as_u16() == 206 => {
-            let total_size = res
-                .content_length()
-                .unwrap_or(0)
-                .saturating_add(start_bytes);
-            let mut stream = res.bytes_stream();
+    loop {
+        // Dynamically inspect local file size to resume from exact byte
+        let current_bytes = match tokio::fs::metadata(&dest_path).await {
+            Ok(meta) => meta.len(),
+            Err(_) => start_bytes,
+        };
 
-            use tokio::io::AsyncWriteExt;
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            let dest_path = format!("{}/Downloads/{}", home, file.name);
-            let mut file_out = match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&dest_path)
-                .await
-            {
-                Ok(f) => f,
-                Err(e) => {
+        if let Some(total) = total_size {
+            if total > 0 && current_bytes >= total {
+                let _ = tx
+                    .send(Event::Action(Action::CompleteDownload(file.id)))
+                    .await;
+                return;
+            }
+        }
+
+        let mut req = client.get(&url).bearer_auth(&access_token);
+        if current_bytes > 0 {
+            req = req.header("Range", format!("bytes={}-", current_bytes));
+        }
+
+        match req.send().await {
+            Ok(res) => {
+                let status = res.status();
+                if status.as_u16() == 401 {
                     let _ = tx
-                        .send(Event::Action(Action::Error(format!("FS err: {}", e))))
+                        .send(Event::Action(Action::Error("401 Unauthorized".to_string())))
                         .await;
                     return;
                 }
-            };
 
-            let mut downloaded = start_bytes;
-            let mut last_downloaded = start_bytes;
-            let mut last_update = std::time::Instant::now();
+                if status.as_u16() == 416 {
+                    // Range Not Satisfiable -> file is already fully downloaded
+                    let _ = tx
+                        .send(Event::Action(Action::CompleteDownload(file.id)))
+                        .await;
+                    return;
+                }
 
-            while let Some(chunk_res) = futures_util::StreamExt::next(&mut stream).await {
-                match chunk_res {
-                    Ok(chunk) => {
-                        if let Err(e) = file_out.write_all(&chunk).await {
-                            let _ = tx
-                                .send(Event::Action(Action::Error(format!("Write err: {}", e))))
-                                .await;
-                            return;
-                        }
-                        downloaded += chunk.len() as u64;
+                if (status.is_server_error() || status.as_u16() == 429) && attempt < max_retries {
+                    let delay = backoff_delays[attempt];
+                    attempt += 1;
+                    let _ = tx
+                        .send(Event::Action(Action::SetDownloadReconnecting(
+                            file.id.clone(),
+                        )))
+                        .await;
+                    let _ = tx
+                        .send(Event::Action(Action::Message(
+                            "Connection lost, reconnecting...".into(),
+                        )))
+                        .await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
 
-                        let now = std::time::Instant::now();
-                        let elapsed = now.duration_since(last_update).as_secs_f64();
-                        if elapsed >= 0.1 {
-                            let speed = if elapsed > 0.0 {
-                                (downloaded - last_downloaded) as f64 / elapsed
-                            } else {
-                                0.0
-                            };
-                            let _ = tx
-                                .send(Event::Action(Action::UpdateDownloadProgress(
-                                    file.id.clone(),
-                                    downloaded,
-                                    total_size,
-                                    speed,
-                                )))
-                                .await;
-                            last_update = now;
-                            last_downloaded = downloaded;
-                        }
-                    }
+                if !status.is_success() && status.as_u16() != 206 {
+                    let body = res.text().await.unwrap_or_default();
+                    let _ = tx
+                        .send(Event::Action(Action::Error(format!(
+                            "DL failed ({}): {}",
+                            status, body
+                        ))))
+                        .await;
+                    return;
+                }
+
+                let reported_len = res.content_length().unwrap_or(0);
+                let current_total = if status.as_u16() == 206 {
+                    reported_len.saturating_add(current_bytes)
+                } else if current_bytes == 0 {
+                    reported_len
+                } else {
+                    // Server sent entire file from 0; truncate and restart
+                    let _ = tokio::fs::write(&dest_path, &[]).await;
+                    reported_len
+                };
+                total_size = Some(current_total);
+
+                let mut file_out = match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&dest_path)
+                    .await
+                {
+                    Ok(f) => f,
                     Err(e) => {
                         let _ = tx
-                            .send(Event::Action(Action::Error(format!("Stream err: {}", e))))
+                            .send(Event::Action(Action::Error(format!("FS err: {}", e))))
                             .await;
                         return;
                     }
+                };
+
+                let mut stream = res.bytes_stream();
+                let mut downloaded = current_bytes;
+                let mut last_downloaded = current_bytes;
+                let mut last_update = std::time::Instant::now();
+                let mut stream_interrupted = false;
+
+                // Reset retry attempts once connected and streaming successfully
+                attempt = 0;
+
+                while let Some(chunk_res) = futures_util::StreamExt::next(&mut stream).await {
+                    match chunk_res {
+                        Ok(chunk) => {
+                            if let Err(e) = file_out.write_all(&chunk).await {
+                                let _ = tx
+                                    .send(Event::Action(Action::Error(format!("Write err: {}", e))))
+                                    .await;
+                                return;
+                            }
+                            downloaded += chunk.len() as u64;
+
+                            let now = std::time::Instant::now();
+                            let elapsed = now.duration_since(last_update).as_secs_f64();
+                            if elapsed >= 0.1 {
+                                let speed = if elapsed > 0.0 {
+                                    (downloaded - last_downloaded) as f64 / elapsed
+                                } else {
+                                    0.0
+                                };
+                                let _ = tx
+                                    .send(Event::Action(Action::UpdateDownloadProgress(
+                                        file.id.clone(),
+                                        downloaded,
+                                        current_total,
+                                        speed,
+                                    )))
+                                    .await;
+                                last_update = now;
+                                last_downloaded = downloaded;
+                            }
+                        }
+                        Err(_e) => {
+                            // Connection lost / Wi-Fi disconnected while streaming chunks
+                            let _ = file_out.flush().await;
+                            stream_interrupted = true;
+                            break;
+                        }
+                    }
                 }
+
+                if stream_interrupted {
+                    let delay = if attempt < max_retries {
+                        backoff_delays[attempt]
+                    } else {
+                        10
+                    };
+                    attempt = (attempt + 1).min(max_retries);
+                    let _ = tx
+                        .send(Event::Action(Action::SetDownloadReconnecting(
+                            file.id.clone(),
+                        )))
+                        .await;
+                    let _ = tx
+                        .send(Event::Action(Action::Message(
+                            "Connection lost, reconnecting...".into(),
+                        )))
+                        .await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+
+                let _ = file_out.flush().await;
+                let _ = tx
+                    .send(Event::Action(Action::CompleteDownload(file.id)))
+                    .await;
+                return;
             }
-            let _ = tx
-                .send(Event::Action(Action::CompleteDownload(file.id)))
-                .await;
-        }
-        Ok(res) => {
-            let _ = tx
-                .send(Event::Action(Action::Error(format!(
-                    "DL failed: {}",
-                    res.status()
-                ))))
-                .await;
-        }
-        Err(e) => {
-            let _ = tx.send(Event::Action(Action::Error(e.to_string()))).await;
+            Err(e) => {
+                if attempt < max_retries {
+                    let delay = backoff_delays[attempt];
+                    attempt += 1;
+                    let _ = tx
+                        .send(Event::Action(Action::SetDownloadReconnecting(
+                            file.id.clone(),
+                        )))
+                        .await;
+                    let _ = tx
+                        .send(Event::Action(Action::Message(
+                            "Connection lost, reconnecting...".into(),
+                        )))
+                        .await;
+                    tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+                    continue;
+                }
+
+                let _ = tx.send(Event::Action(Action::Error(e.to_string()))).await;
+                return;
+            }
         }
     }
 }
