@@ -10,6 +10,9 @@ use std::io::Stdout;
 use tokio::sync::mpsc;
 
 pub fn trigger_preview(app: &mut App, client: &Client, token: &str, tx: &mpsc::Sender<Event>) {
+    if let Some(h) = app.preview.active_task.take() {
+        h.abort();
+    }
     if app.preview.mode == PreviewMode::Hidden {
         return;
     }
@@ -22,15 +25,13 @@ pub fn trigger_preview(app: &mut App, client: &Client, token: &str, tx: &mpsc::S
         let txc = tx.clone();
 
         if file.mime_type.starts_with("image/") && app.preview.mode == PreviewMode::Default {
-            tokio::spawn(async move {
+            app.preview.active_task = Some(tokio::spawn(async move {
                 crate::drive::api::fetch_preview(c, t, fid, txc).await;
-            });
-        } else if file.mime_type != "application/vnd.google-apps.folder" {
-            tokio::spawn(async move {
-                crate::drive::api::fetch_metadata(c, t, fid, txc).await;
-            });
+            }));
         } else {
-            app.preview.state = PreviewState::None;
+            app.preview.active_task = Some(tokio::spawn(async move {
+                crate::drive::api::fetch_metadata(c, t, fid, txc).await;
+            }));
         }
     }
 }
@@ -224,5 +225,25 @@ mod tests {
         assert!(!is_editable_text("application/pdf"));
         assert!(!is_editable_text("application/octet-stream"));
         assert!(!is_editable_text("application/vnd.google-apps.folder"));
+    }
+
+    #[tokio::test]
+    async fn test_trigger_preview_folder_sets_loading_state() {
+        let mut app = App::new();
+        app.preview.mode = PreviewMode::Default;
+        app.files = vec![DriveFile {
+            id: "folder_123".to_string(),
+            name: "Documents".to_string(),
+            mime_type: "application/vnd.google-apps.folder".to_string(),
+            app_properties: None,
+        }];
+        app.state.select(Some(0));
+
+        let client = Client::new();
+        let (tx, _rx) = mpsc::channel(1);
+
+        trigger_preview(&mut app, &client, "fake_token", &tx);
+
+        assert!(matches!(app.preview.state, PreviewState::Loading));
     }
 }

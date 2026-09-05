@@ -23,8 +23,8 @@ pub async fn download_file_ranged(
 
     let mut total_size: Option<u64> = None;
     let mut attempt = 0;
-    let backoff_delays = [3, 5, 10, 10, 10];
-    let max_retries = backoff_delays.len();
+    let backoff_delays = [2, 3, 5, 10];
+    let max_retries = 60;
 
     // If starting from 0 initially, truncate any existing file
     if start_bytes == 0 {
@@ -76,7 +76,11 @@ pub async fn download_file_ranged(
                 }
 
                 if (status.is_server_error() || status.as_u16() == 429) && attempt < max_retries {
-                    let delay = backoff_delays[attempt];
+                    let delay = if attempt < backoff_delays.len() {
+                        backoff_delays[attempt]
+                    } else {
+                        10
+                    };
                     attempt += 1;
                     let _ = tx
                         .send(Event::Action(Action::SetDownloadReconnecting(
@@ -84,9 +88,10 @@ pub async fn download_file_ranged(
                         )))
                         .await;
                     let _ = tx
-                        .send(Event::Action(Action::Message(
-                            "Connection lost, reconnecting...".into(),
-                        )))
+                        .send(Event::Action(Action::Message(format!(
+                            "Connection lost, reconnecting (attempt {})...",
+                            attempt
+                        ))))
                         .await;
                     tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
                     continue;
@@ -95,10 +100,10 @@ pub async fn download_file_ranged(
                 if !status.is_success() && status.as_u16() != 206 {
                     let body = res.text().await.unwrap_or_default();
                     let _ = tx
-                        .send(Event::Action(Action::Error(format!(
-                            "DL failed ({}): {}",
-                            status, body
-                        ))))
+                        .send(Event::Action(Action::DownloadFailed(
+                            file.id.clone(),
+                            format!("DL failed ({}): {}", status, body),
+                        )))
                         .await;
                     return;
                 }
@@ -124,7 +129,10 @@ pub async fn download_file_ranged(
                     Ok(f) => f,
                     Err(e) => {
                         let _ = tx
-                            .send(Event::Action(Action::Error(format!("FS err: {}", e))))
+                            .send(Event::Action(Action::DownloadFailed(
+                                file.id.clone(),
+                                format!("FS err: {}", e),
+                            )))
                             .await;
                         return;
                     }
@@ -138,13 +146,30 @@ pub async fn download_file_ranged(
 
                 // Reset retry attempts once connected and streaming successfully
                 attempt = 0;
+                let _ = tx
+                    .send(Event::Action(Action::SetDownloadDownloading(
+                        file.id.clone(),
+                    )))
+                    .await;
+                let _ = tx
+                    .send(Event::Action(Action::UpdateDownloadProgress(
+                        file.id.clone(),
+                        current_bytes,
+                        current_total,
+                        0.0,
+                    )))
+                    .await;
 
+                let mut is_first_chunk = true;
                 while let Some(chunk_res) = futures_util::StreamExt::next(&mut stream).await {
                     match chunk_res {
                         Ok(chunk) => {
                             if let Err(e) = file_out.write_all(&chunk).await {
                                 let _ = tx
-                                    .send(Event::Action(Action::Error(format!("Write err: {}", e))))
+                                    .send(Event::Action(Action::DownloadFailed(
+                                        file.id.clone(),
+                                        format!("Write err: {}", e),
+                                    )))
                                     .await;
                                 return;
                             }
@@ -152,7 +177,8 @@ pub async fn download_file_ranged(
 
                             let now = std::time::Instant::now();
                             let elapsed = now.duration_since(last_update).as_secs_f64();
-                            if elapsed >= 0.1 {
+                            if is_first_chunk || elapsed >= 0.1 {
+                                is_first_chunk = false;
                                 let speed = if elapsed > 0.0 {
                                     (downloaded - last_downloaded) as f64 / elapsed
                                 } else {
@@ -180,24 +206,43 @@ pub async fn download_file_ranged(
                 }
 
                 if stream_interrupted {
-                    let delay = if attempt < max_retries {
+                    let delay = if attempt < backoff_delays.len() {
                         backoff_delays[attempt]
                     } else {
                         10
                     };
-                    attempt = (attempt + 1).min(max_retries);
+                    attempt += 1;
                     let _ = tx
                         .send(Event::Action(Action::SetDownloadReconnecting(
                             file.id.clone(),
                         )))
                         .await;
                     let _ = tx
-                        .send(Event::Action(Action::Message(
-                            "Connection lost, reconnecting...".into(),
-                        )))
+                        .send(Event::Action(Action::Message(format!(
+                            "Connection lost, reconnecting (attempt {})...",
+                            attempt
+                        ))))
                         .await;
                     tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
                     continue;
+                }
+
+                if downloaded > last_downloaded {
+                    let now = std::time::Instant::now();
+                    let elapsed = now.duration_since(last_update).as_secs_f64();
+                    let speed = if elapsed > 0.0 {
+                        (downloaded - last_downloaded) as f64 / elapsed
+                    } else {
+                        0.0
+                    };
+                    let _ = tx
+                        .send(Event::Action(Action::UpdateDownloadProgress(
+                            file.id.clone(),
+                            downloaded,
+                            current_total,
+                            speed,
+                        )))
+                        .await;
                 }
 
                 let _ = file_out.flush().await;
@@ -208,7 +253,11 @@ pub async fn download_file_ranged(
             }
             Err(e) => {
                 if attempt < max_retries {
-                    let delay = backoff_delays[attempt];
+                    let delay = if attempt < backoff_delays.len() {
+                        backoff_delays[attempt]
+                    } else {
+                        10
+                    };
                     attempt += 1;
                     let _ = tx
                         .send(Event::Action(Action::SetDownloadReconnecting(
@@ -216,15 +265,21 @@ pub async fn download_file_ranged(
                         )))
                         .await;
                     let _ = tx
-                        .send(Event::Action(Action::Message(
-                            "Connection lost, reconnecting...".into(),
-                        )))
+                        .send(Event::Action(Action::Message(format!(
+                            "Connection lost, reconnecting (attempt {})...",
+                            attempt
+                        ))))
                         .await;
                     tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
                     continue;
                 }
 
-                let _ = tx.send(Event::Action(Action::Error(e.to_string()))).await;
+                let _ = tx
+                    .send(Event::Action(Action::DownloadFailed(
+                        file.id.clone(),
+                        format!("Max retries reached: {}", e),
+                    )))
+                    .await;
                 return;
             }
         }

@@ -5,28 +5,45 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 
 pub async fn fetch_trash(client: Client, access_token: String, tx: mpsc::Sender<Event>) {
-    let url =
-        "https://www.googleapis.com/drive/v3/files?q=trashed=true&pageSize=1000&fields=files(id,name,mimeType,appProperties)";
-    match send_with_retry(|| client.get(url).bearer_auth(&access_token), 3).await {
-        Ok(res) if res.status().is_success() => {
-            #[derive(serde::Deserialize)]
-            struct FilesResponse {
-                files: Vec<DriveFile>,
-            }
-            if let Ok(data) = res.json::<FilesResponse>().await {
-                let _ = tx.send(Event::Action(Action::LoadTrash(data.files))).await;
-            }
+    let mut all_files = Vec::new();
+    let mut page_token: Option<String> = None;
+
+    loop {
+        let mut url = "https://www.googleapis.com/drive/v3/files?q=trashed=true&orderBy=folder,name_natural&pageSize=1000&fields=nextPageToken,files(id,name,mimeType,appProperties)".to_string();
+        if let Some(ref pt) = page_token {
+            url.push_str(&format!("&pageToken={}", urlencoding::encode(pt)));
         }
-        Ok(res) => {
-            let err = res.text().await.unwrap_or_default();
-            let _ = tx
-                .send(Event::Action(Action::Error(format!("Trash err: {}", err))))
-                .await;
-        }
-        Err(e) => {
-            let _ = tx.send(Event::Action(Action::Error(e.to_string()))).await;
+
+        match send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await {
+            Ok(res) if res.status().is_success() => {
+                if let Ok(resp) = res.json::<crate::drive::models::FileListResponse>().await {
+                    all_files.extend(resp.files);
+                    match resp.next_page_token {
+                        Some(token) if !token.trim().is_empty() => {
+                            page_token = Some(token);
+                        }
+                        _ => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+            Ok(res) => {
+                let err = res.text().await.unwrap_or_default();
+                let _ = tx
+                    .send(Event::Action(Action::Error(format!("Trash err: {}", err))))
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(Event::Action(Action::Error(e.to_string()))).await;
+                return;
+            }
         }
     }
+
+    crate::drive::api::sort_files(&mut all_files);
+    let _ = tx.send(Event::Action(Action::LoadTrash(all_files))).await;
 }
 
 pub async fn restore_file(

@@ -21,7 +21,12 @@ pub fn handle_action(
             }
 
             // 1. Resume active or pending download automatically
-            if app.download.active_task.is_none() {
+            let is_dl_running = app
+                .download
+                .active_task
+                .as_ref()
+                .is_some_and(|h| !h.is_finished());
+            if !is_dl_running {
                 if let Some(target) = app
                     .download
                     .manager
@@ -36,6 +41,9 @@ pub fn handle_action(
                     let f = target.file.clone();
                     let start_bytes = target.downloaded_bytes;
                     app.status = format!("Resuming download for {}...", f.name);
+                    if let Some(h) = app.download.active_task.take() {
+                        h.abort();
+                    }
                     app.download.active_task = Some(tokio::spawn(async move {
                         crate::drive::download::download_file_ranged(c, t, f, start_bytes, txc)
                             .await;
@@ -44,7 +52,12 @@ pub fn handle_action(
             }
 
             // 2. Resume active or pending upload automatically
-            if app.upload.active_task.is_none() {
+            let is_ul_running = app
+                .upload
+                .active_task
+                .as_ref()
+                .is_some_and(|h| !h.is_finished());
+            if !is_ul_running {
                 if let Some(target) = app
                     .upload
                     .manager
@@ -58,6 +71,9 @@ pub fn handle_action(
                     let token_c = token.access_token.clone();
                     let tx_c = tx.clone();
                     app.status = format!("Resuming upload for {}...", target.name);
+                    if let Some(h) = app.upload.active_task.take() {
+                        h.abort();
+                    }
                     app.upload.active_task = Some(tokio::spawn(async move {
                         upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                     }));
@@ -83,7 +99,8 @@ pub fn handle_action(
         Action::TokenRefreshFailed => {
             app.is_refreshing_token = false;
         }
-        Action::LoadFiles(files) => {
+        Action::LoadFiles(mut files) => {
+            crate::drive::api::sort_files(&mut files);
             app.files = files;
             app.status = format!("Loaded {} items.", app.files.len());
             app.state
@@ -111,7 +128,8 @@ pub fn handle_action(
                 crate::drive::api::fetch_files(c, t, query, txc).await;
             });
         }
-        Action::LoadTrash(files) => {
+        Action::LoadTrash(mut files) => {
+            crate::drive::api::sort_files(&mut files);
             app.trash.files = files;
             app.status = format!("Loaded {} trashed items.", app.trash.files.len());
             app.trash.state.select(if app.trash.files.is_empty() {
@@ -133,15 +151,31 @@ pub fn handle_action(
                 });
             }
             // Start if none active
-            if app.download.active_task.is_none() {
-                if let Some(first) = app.download.manager.queue.first_mut() {
+            let is_dl_running = app
+                .download
+                .active_task
+                .as_ref()
+                .is_some_and(|h| !h.is_finished());
+            if !is_dl_running {
+                if let Some(first) = app
+                    .download
+                    .manager
+                    .queue
+                    .iter_mut()
+                    .find(|t| t.status == models::DownloadStatus::Pending)
+                {
                     first.status = models::DownloadStatus::Downloading;
                     let c = client.clone();
                     let t = token.access_token.clone();
                     let txc = tx.clone();
                     let f = first.file.clone();
+                    let start_bytes = first.downloaded_bytes;
+                    if let Some(h) = app.download.active_task.take() {
+                        h.abort();
+                    }
                     app.download.active_task = Some(tokio::spawn(async move {
-                        crate::drive::download::download_file_ranged(c, t, f, 0, txc).await;
+                        crate::drive::download::download_file_ranged(c, t, f, start_bytes, txc)
+                            .await;
                     }));
                 }
             }
@@ -156,8 +190,13 @@ pub fn handle_action(
             {
                 task.downloaded_bytes = dl;
                 task.total_bytes = total;
-                if task.status == models::DownloadStatus::Reconnecting {
-                    task.status = models::DownloadStatus::Downloading;
+                task.status = models::DownloadStatus::Downloading;
+            }
+            if app.status.contains("reconnecting") || app.status.contains("Connection lost") {
+                if let Some(task) = app.download.manager.queue.iter().find(|t| t.file.id == id) {
+                    app.status = format!("Downloading {}...", task.file.name);
+                } else {
+                    app.status = "Downloading...".to_string();
                 }
             }
             app.download.manager.speed_history.push_back(speed as u64);
@@ -170,7 +209,12 @@ pub fn handle_action(
             for t in tasks {
                 app.upload.manager.queue.push(t);
             }
-            if app.upload.active_task.is_none() {
+            let is_ul_running = app
+                .upload
+                .active_task
+                .as_ref()
+                .is_some_and(|h| !h.is_finished());
+            if !is_ul_running {
                 if let Some(first) = app
                     .upload
                     .manager
@@ -183,6 +227,9 @@ pub fn handle_action(
                     let client_c = client.clone();
                     let token_c = token.access_token.clone();
                     let tx_c = tx.clone();
+                    if let Some(h) = app.upload.active_task.take() {
+                        h.abort();
+                    }
                     app.upload.active_task = Some(tokio::spawn(async move {
                         upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                     }));
@@ -200,8 +247,13 @@ pub fn handle_action(
             {
                 task.uploaded_bytes = downloaded;
                 task.total_bytes = total;
-                if task.status == models::UploadStatus::Reconnecting {
-                    task.status = models::UploadStatus::Uploading;
+                task.status = models::UploadStatus::Uploading;
+            }
+            if app.status.contains("reconnecting") || app.status.contains("Connection lost") {
+                if let Some(task) = app.upload.manager.queue.iter().find(|t| t.local_path == id) {
+                    app.status = format!("Uploading {}...", task.name);
+                } else {
+                    app.status = "Uploading...".to_string();
                 }
             }
             app.upload.manager.speed_history.push_back(speed as u64);
@@ -227,6 +279,7 @@ pub fn handle_action(
                 let client_c = client.clone();
                 let token_c = token.access_token.clone();
                 let tx_c = tx.clone();
+                app.status = format!("Uploading {}...", task_clone.name);
                 app.upload.active_task = Some(tokio::spawn(async move {
                     upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                 }));
@@ -285,6 +338,7 @@ pub fn handle_action(
                 let txc = tx.clone();
                 let f = first.file.clone();
                 let start_bytes = first.downloaded_bytes;
+                app.status = format!("Downloading {}...", f.name);
                 app.download.active_task = Some(tokio::spawn(async move {
                     crate::drive::download::download_file_ranged(c, t, f, start_bytes, txc).await;
                 }));
@@ -311,8 +365,12 @@ pub fn handle_action(
             {
                 app.download.progress = None;
                 app.upload.progress = None;
-                app.download.active_task = None;
-                app.upload.active_task = None;
+                if let Some(h) = app.download.active_task.take() {
+                    h.abort();
+                }
+                if let Some(h) = app.upload.active_task.take() {
+                    h.abort();
+                }
 
                 if !app.is_refreshing_token {
                     app.is_refreshing_token = true;
@@ -358,6 +416,17 @@ pub fn handle_action(
                         }
                     });
                 }
+            } else {
+                if let Some(ref h) = app.download.active_task {
+                    if h.is_finished() {
+                        app.download.active_task = None;
+                    }
+                }
+                if let Some(ref h) = app.upload.active_task {
+                    if h.is_finished() {
+                        app.upload.active_task = None;
+                    }
+                }
             }
         }
 
@@ -378,14 +447,27 @@ pub fn handle_action(
                 }
             }
         }
-        Action::PreviewMetadataLoaded(name, size, created, modified) => {
+        Action::PreviewMetadataLoaded {
+            id,
+            name,
+            size,
+            items_count,
+            is_calculating,
+            created,
+            modified,
+        } => {
             if app.preview.mode != PreviewMode::Hidden {
-                app.preview.state = PreviewState::Metadata {
-                    name,
-                    size,
-                    created,
-                    modified,
-                };
+                let is_current = app.selected_file().is_some_and(|f| f.id == id);
+                if is_current {
+                    app.preview.state = PreviewState::Metadata {
+                        name,
+                        size,
+                        items_count,
+                        is_calculating,
+                        created,
+                        modified,
+                    };
+                }
             }
         }
         Action::UpdateResumeTime(id, time) => {
@@ -419,6 +501,66 @@ pub fn handle_action(
                 task.status = models::UploadStatus::Reconnecting;
             }
         }
+        Action::SetDownloadDownloading(id) => {
+            if let Some(task) = app
+                .download
+                .manager
+                .queue
+                .iter_mut()
+                .find(|t| t.file.id == id)
+            {
+                task.status = models::DownloadStatus::Downloading;
+                if app.status.contains("reconnecting") || app.status.contains("Connection lost") {
+                    app.status = format!("Downloading {}...", task.file.name);
+                }
+            }
+        }
+        Action::SetUploadUploading(local_path) => {
+            if let Some(task) = app
+                .upload
+                .manager
+                .queue
+                .iter_mut()
+                .find(|t| t.local_path == local_path)
+            {
+                task.status = models::UploadStatus::Uploading;
+                if app.status.contains("reconnecting") || app.status.contains("Connection lost") {
+                    app.status = format!("Uploading {}...", task.name);
+                }
+            }
+        }
+        Action::DownloadFailed(id, msg) => {
+            if let Some(task) = app
+                .download
+                .manager
+                .queue
+                .iter_mut()
+                .find(|t| t.file.id == id)
+            {
+                task.status = models::DownloadStatus::Paused;
+            }
+            if let Some(h) = app.download.active_task.take() {
+                h.abort();
+            }
+            app.download.progress = None;
+            app.status = format!("Download paused ({}). Press 'r' in tracker to retry.", msg);
+        }
+        Action::UploadFailed(local_path, msg) => {
+            if let Some(task) = app
+                .upload
+                .manager
+                .queue
+                .iter_mut()
+                .find(|t| t.local_path == local_path)
+            {
+                task.status = models::UploadStatus::Paused;
+            }
+            if let Some(h) = app.upload.active_task.take() {
+                h.abort();
+            }
+            app.upload.progress = None;
+            app.status = format!("Upload paused ({}). Press 'r' in tracker to retry.", msg);
+        }
         Action::RefreshFolder(folder_id) => {
             if app.nav.current_path == folder_id {
                 let c = client.clone();
@@ -438,5 +580,241 @@ pub fn handle_action(
         Action::ClearClipboard => {
             app.clipboard = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_download_failed_pauses_task_and_cleans_up() {
+        let mut app = App::new();
+        let file = models::DriveFile {
+            id: "file123".to_string(),
+            name: "test.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            app_properties: None,
+        };
+        app.download.manager.queue.push(models::DownloadTask {
+            file,
+            total_bytes: 1024,
+            downloaded_bytes: 512,
+            status: models::DownloadStatus::Reconnecting,
+        });
+        app.download.progress = Some((512, 1024, 100.0));
+
+        let client = Client::new();
+        let mut token = auth::Token {
+            access_token: "token".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            scope: "drive".to_string(),
+        };
+        let auth_info = auth::AuthInfo {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+        };
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_action(
+            &mut app,
+            Action::DownloadFailed("file123".to_string(), "Network unreachable".to_string()),
+            &client,
+            &mut token,
+            &auth_info,
+            &tx,
+        );
+
+        assert_eq!(
+            app.download.manager.queue[0].status,
+            models::DownloadStatus::Paused
+        );
+        assert!(app.download.active_task.is_none());
+        assert!(app.download.progress.is_none());
+        assert!(app.status.contains("Download paused"));
+    }
+
+    #[test]
+    fn test_upload_failed_pauses_task_and_cleans_up() {
+        let mut app = App::new();
+        app.upload.manager.queue.push(models::UploadTask {
+            local_path: "/tmp/upload.pdf".to_string(),
+            name: "upload.pdf".to_string(),
+            target_parent_id: "root".to_string(),
+            total_bytes: 2048,
+            uploaded_bytes: 1024,
+            status: models::UploadStatus::Reconnecting,
+        });
+        app.upload.progress = Some((1024, 2048, 50.0));
+
+        let client = Client::new();
+        let mut token = auth::Token {
+            access_token: "token".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            scope: "drive".to_string(),
+        };
+        let auth_info = auth::AuthInfo {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+        };
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_action(
+            &mut app,
+            Action::UploadFailed("/tmp/upload.pdf".to_string(), "Timeout".to_string()),
+            &client,
+            &mut token,
+            &auth_info,
+            &tx,
+        );
+
+        assert_eq!(
+            app.upload.manager.queue[0].status,
+            models::UploadStatus::Paused
+        );
+        assert!(app.upload.active_task.is_none());
+        assert!(app.upload.progress.is_none());
+        assert!(app.status.contains("Upload paused"));
+    }
+
+    #[test]
+    fn test_set_download_downloading_clears_reconnecting_status() {
+        let mut app = App::new();
+        let file = models::DriveFile {
+            id: "file123".to_string(),
+            name: "video.mp4".to_string(),
+            mime_type: "video/mp4".to_string(),
+            app_properties: None,
+        };
+        app.download.manager.queue.push(models::DownloadTask {
+            file,
+            total_bytes: 5000,
+            downloaded_bytes: 2500,
+            status: models::DownloadStatus::Reconnecting,
+        });
+        app.status = "Connection lost, reconnecting (attempt 3)...".to_string();
+
+        let client = Client::new();
+        let mut token = auth::Token {
+            access_token: "token".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            scope: "drive".to_string(),
+        };
+        let auth_info = auth::AuthInfo {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+        };
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_action(
+            &mut app,
+            Action::SetDownloadDownloading("file123".to_string()),
+            &client,
+            &mut token,
+            &auth_info,
+            &tx,
+        );
+
+        assert_eq!(
+            app.download.manager.queue[0].status,
+            models::DownloadStatus::Downloading
+        );
+        assert_eq!(app.status, "Downloading video.mp4...");
+    }
+
+    #[test]
+    fn test_set_upload_uploading_clears_reconnecting_status() {
+        let mut app = App::new();
+        app.upload.manager.queue.push(models::UploadTask {
+            local_path: "/tmp/data.csv".to_string(),
+            name: "data.csv".to_string(),
+            target_parent_id: "root".to_string(),
+            total_bytes: 2048,
+            uploaded_bytes: 1024,
+            status: models::UploadStatus::Reconnecting,
+        });
+        app.status = "Connection lost, reconnecting (attempt 2)...".to_string();
+
+        let client = Client::new();
+        let mut token = auth::Token {
+            access_token: "token".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            scope: "drive".to_string(),
+        };
+        let auth_info = auth::AuthInfo {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+        };
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_action(
+            &mut app,
+            Action::SetUploadUploading("/tmp/data.csv".to_string()),
+            &client,
+            &mut token,
+            &auth_info,
+            &tx,
+        );
+
+        assert_eq!(
+            app.upload.manager.queue[0].status,
+            models::UploadStatus::Uploading
+        );
+        assert_eq!(app.status, "Uploading data.csv...");
+    }
+
+    #[test]
+    fn test_update_progress_clears_reconnecting_status() {
+        let mut app = App::new();
+        let file = models::DriveFile {
+            id: "file999".to_string(),
+            name: "doc.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            app_properties: None,
+        };
+        app.download.manager.queue.push(models::DownloadTask {
+            file,
+            total_bytes: 1000,
+            downloaded_bytes: 200,
+            status: models::DownloadStatus::Reconnecting,
+        });
+        app.status = "Connection lost, reconnecting (attempt 1)...".to_string();
+
+        let client = Client::new();
+        let mut token = auth::Token {
+            access_token: "token".to_string(),
+            expires_in: 3600,
+            token_type: "Bearer".to_string(),
+            refresh_token: None,
+            scope: "drive".to_string(),
+        };
+        let auth_info = auth::AuthInfo {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+        };
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_action(
+            &mut app,
+            Action::UpdateDownloadProgress("file999".to_string(), 400, 1000, 200.0),
+            &client,
+            &mut token,
+            &auth_info,
+            &tx,
+        );
+
+        assert_eq!(
+            app.download.manager.queue[0].status,
+            models::DownloadStatus::Downloading
+        );
+        assert_eq!(app.status, "Downloading doc.pdf...");
     }
 }

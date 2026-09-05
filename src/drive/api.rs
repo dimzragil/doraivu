@@ -1,4 +1,4 @@
-use crate::drive::models::{DriveFile, UploadStatus, UploadTask};
+use crate::drive::models::{DriveFile, FileListResponse, UploadStatus, UploadTask};
 use crate::tui::state::{Action, Clipboard, ClipboardAction, Event};
 use reqwest::Client;
 use tokio::sync::mpsc;
@@ -43,50 +43,97 @@ where
     }
 }
 
-/// Fetches files from Google Drive matching the query
+/// Sorts a slice of DriveFiles so that folders are pinned to the top,
+/// and both folders and files are ordered alphabetically (case-insensitive).
+pub fn sort_files(files: &mut [DriveFile]) {
+    files.sort_by(|a, b| {
+        let a_is_folder = a.mime_type == "application/vnd.google-apps.folder";
+        let b_is_folder = b.mime_type == "application/vnd.google-apps.folder";
+
+        match (a_is_folder, b_is_folder) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a
+                .name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.name.cmp(&b.name)),
+        }
+    });
+}
+
+/// Fetches all files from Google Drive matching the query, with pagination support
 pub async fn fetch_files(
     client: Client,
     access_token: String,
     query: String,
     tx: mpsc::Sender<Event>,
 ) {
-    let url = format!(
-        "https://www.googleapis.com/drive/v3/files?q={}&fields=files(id,name,mimeType,appProperties)",
-        urlencoding::encode(&query)
-    );
+    let mut all_files = Vec::new();
+    let mut page_token: Option<String> = None;
+    let mut page_num = 1;
 
-    match send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await {
-        Ok(res) => {
-            if res.status().is_success() {
-                #[derive(serde::Deserialize)]
-                struct FilesList {
-                    files: Vec<DriveFile>,
-                }
-                match res.json::<FilesList>().await {
-                    Ok(list) => {
-                        let _ = tx.send(Event::Action(Action::LoadFiles(list.files))).await;
+    loop {
+        let mut url = format!(
+            "https://www.googleapis.com/drive/v3/files?q={}&pageSize=1000&orderBy=folder,name_natural&fields=nextPageToken,files(id,name,mimeType,appProperties)",
+            urlencoding::encode(&query)
+        );
+        if let Some(ref pt) = page_token {
+            url.push_str(&format!("&pageToken={}", urlencoding::encode(pt)));
+        }
+
+        if page_num > 1 {
+            let _ = tx
+                .send(Event::Action(Action::Message(format!(
+                    "Fetching page {} ({} items loaded)...",
+                    page_num,
+                    all_files.len()
+                ))))
+                .await;
+        }
+
+        match send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await {
+            Ok(res) => {
+                if res.status().is_success() {
+                    match res.json::<FileListResponse>().await {
+                        Ok(resp) => {
+                            all_files.extend(resp.files);
+                            match resp.next_page_token {
+                                Some(token) if !token.trim().is_empty() => {
+                                    page_token = Some(token);
+                                    page_num += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Event::Action(Action::Error(format!("JSON Parse: {}", e))))
+                                .await;
+                            return;
+                        }
                     }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Event::Action(Action::Error(format!("JSON Parse: {}", e))))
-                            .await;
-                    }
+                } else {
+                    let status = res.status();
+                    let body = res.text().await.unwrap_or_default();
+                    let _ = tx
+                        .send(Event::Action(Action::Error(format!(
+                            "API Error {}: {}",
+                            status, body
+                        ))))
+                        .await;
+                    return;
                 }
-            } else {
-                let status = res.status();
-                let body = res.text().await.unwrap_or_default();
-                let _ = tx
-                    .send(Event::Action(Action::Error(format!(
-                        "API Error {}: {}",
-                        status, body
-                    ))))
-                    .await;
+            }
+            Err(e) => {
+                let _ = tx.send(Event::Action(Action::Error(e.to_string()))).await;
+                return;
             }
         }
-        Err(e) => {
-            let _ = tx.send(Event::Action(Action::Error(e.to_string()))).await;
-        }
     }
+
+    sort_files(&mut all_files);
+    let _ = tx.send(Event::Action(Action::LoadFiles(all_files))).await;
 }
 
 /// Moves a file to the trash in Google Drive
@@ -573,8 +620,46 @@ pub async fn fetch_metadata(
     file_id: String,
     tx: mpsc::Sender<Event>,
 ) {
+    if file_id == "shared_with_me" {
+        let _ = tx
+            .send(Event::Action(Action::PreviewMetadataLoaded {
+                id: file_id.clone(),
+                name: "Shared with me".to_string(),
+                size: Some(0),
+                items_count: Some(0),
+                is_calculating: true,
+                created: "-".to_string(),
+                modified: "-".to_string(),
+            }))
+            .await;
+
+        let (size, count) = calculate_shared_with_me_size(
+            &client,
+            &access_token,
+            &tx,
+            &file_id,
+            "Shared with me",
+            "-",
+            "-",
+        )
+        .await;
+
+        let _ = tx
+            .send(Event::Action(Action::PreviewMetadataLoaded {
+                id: file_id,
+                name: "Shared with me".to_string(),
+                size,
+                items_count: count,
+                is_calculating: false,
+                created: "-".to_string(),
+                modified: "-".to_string(),
+            }))
+            .await;
+        return;
+    }
+
     let url = format!(
-        "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,mimeType,size,createdTime,modifiedTime,appProperties",
+        "https://www.googleapis.com/drive/v3/files/{}?fields=id,name,mimeType,size,createdTime,modifiedTime,appProperties&supportsAllDrives=true",
         file_id
     );
     match send_with_retry(|| client.get(&url).bearer_auth(&access_token), 3).await {
@@ -582,6 +667,8 @@ pub async fn fetch_metadata(
             #[derive(serde::Deserialize)]
             struct MetadataResponse {
                 name: String,
+                #[serde(rename = "mimeType")]
+                mime_type: Option<String>,
                 size: Option<String>,
                 #[serde(rename = "createdTime")]
                 created_time: Option<String>,
@@ -589,18 +676,385 @@ pub async fn fetch_metadata(
                 modified_time: Option<String>,
             }
             if let Ok(data) = res.json::<MetadataResponse>().await {
-                let size = data.size.and_then(|s| s.parse::<u64>().ok());
                 let created = data.created_time.unwrap_or_else(|| "Unknown".to_string());
                 let modified = data.modified_time.unwrap_or_else(|| "Unknown".to_string());
-                let _ = tx
-                    .send(Event::Action(Action::PreviewMetadataLoaded(
-                        data.name, size, created, modified,
-                    )))
+                let is_folder = data
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|m| m == "application/vnd.google-apps.folder");
+
+                if is_folder {
+                    // Send initial metadata immediately with is_calculating: true
+                    let _ = tx
+                        .send(Event::Action(Action::PreviewMetadataLoaded {
+                            id: file_id.clone(),
+                            name: data.name.clone(),
+                            size: Some(0),
+                            items_count: Some(0),
+                            is_calculating: true,
+                            created: created.clone(),
+                            modified: modified.clone(),
+                        }))
+                        .await;
+
+                    // Calculate total folder size and items count recursively with live streaming
+                    let (folder_size, count) = calculate_folder_size(
+                        &client,
+                        &access_token,
+                        &file_id,
+                        &tx,
+                        &data.name,
+                        &created,
+                        &modified,
+                    )
                     .await;
+
+                    let _ = tx
+                        .send(Event::Action(Action::PreviewMetadataLoaded {
+                            id: file_id,
+                            name: data.name,
+                            size: folder_size,
+                            items_count: count,
+                            is_calculating: false,
+                            created,
+                            modified,
+                        }))
+                        .await;
+                } else {
+                    let size = data.size.and_then(|s| s.parse::<u64>().ok());
+                    let _ = tx
+                        .send(Event::Action(Action::PreviewMetadataLoaded {
+                            id: file_id,
+                            name: data.name,
+                            size,
+                            items_count: None,
+                            is_calculating: false,
+                            created,
+                            modified,
+                        }))
+                        .await;
+                }
             }
         }
         _ => {}
     }
+}
+
+#[derive(serde::Deserialize)]
+struct FolderChildItem {
+    id: String,
+    #[serde(rename = "mimeType")]
+    mime_type: Option<String>,
+    size: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct FolderChildrenResponse {
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+    files: Option<Vec<FolderChildItem>>,
+}
+
+async fn fetch_folder_children(
+    client: &Client,
+    access_token: &str,
+    folder_id: &str,
+) -> (Vec<String>, u64, usize) {
+    let mut subfolders = Vec::new();
+    let mut bytes = 0u64;
+    let mut items = 0usize;
+    let mut page_token: Option<String> = None;
+
+    loop {
+        let pt_clone = page_token.clone();
+        let f_id = folder_id.to_string();
+        let token = access_token.to_string();
+        let c = client.clone();
+
+        let res = match send_with_retry(
+            move || {
+                let mut r = c
+                    .get("https://www.googleapis.com/drive/v3/files")
+                    .bearer_auth(&token)
+                    .query(&[
+                        ("q", format!("'{}' in parents and trashed = false", f_id)),
+                        (
+                            "fields",
+                            "nextPageToken,files(id,mimeType,size)".to_string(),
+                        ),
+                        ("pageSize", "1000".to_string()),
+                        ("supportsAllDrives", "true".to_string()),
+                        ("includeItemsFromAllDrives", "true".to_string()),
+                    ]);
+                if let Some(ref pt) = pt_clone {
+                    r = r.query(&[("pageToken", pt)]);
+                }
+                r
+            },
+            3,
+        )
+        .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => break,
+        };
+
+        let data = match res.json::<FolderChildrenResponse>().await {
+            Ok(d) => d,
+            Err(_) => break,
+        };
+
+        if let Some(files) = data.files {
+            for item in files {
+                items += 1;
+                if item
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|m| m == "application/vnd.google-apps.folder")
+                {
+                    subfolders.push(item.id);
+                } else if let Some(ref sz_str) = item.size {
+                    if let Ok(sz) = sz_str.parse::<u64>() {
+                        bytes = bytes.saturating_add(sz);
+                    }
+                }
+            }
+        }
+
+        page_token = data.next_page_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+
+    (subfolders, bytes, items)
+}
+
+pub async fn calculate_folder_size(
+    client: &Client,
+    access_token: &str,
+    folder_id: &str,
+    tx: &mpsc::Sender<Event>,
+    folder_name: &str,
+    created: &str,
+    modified: &str,
+) -> (Option<u64>, Option<usize>) {
+    use futures_util::stream::FuturesUnordered;
+    use futures_util::StreamExt;
+
+    let mut total_bytes: u64 = 0;
+    let mut total_items: usize = 0;
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(folder_id.to_string());
+
+    let mut folders_visited = 0;
+    let max_folders = 10000;
+    let start_time = std::time::Instant::now();
+    let max_duration = std::time::Duration::from_secs(120);
+    let mut last_ui_update = std::time::Instant::now();
+
+    let mut in_flight = FuturesUnordered::new();
+    let max_concurrency = 6;
+
+    while !queue.is_empty() || !in_flight.is_empty() {
+        if start_time.elapsed() >= max_duration || folders_visited >= max_folders {
+            break;
+        }
+
+        // Fill in-flight pool up to max_concurrency
+        while in_flight.len() < max_concurrency && folders_visited < max_folders {
+            if let Some(next_id) = queue.pop_front() {
+                folders_visited += 1;
+                let c = client.clone();
+                let tok = access_token.to_string();
+                in_flight.push(async move { fetch_folder_children(&c, &tok, &next_id).await });
+            } else {
+                break;
+            }
+        }
+
+        // Await next completed folder fetch
+        if let Some((subfolders, bytes, items)) = in_flight.next().await {
+            total_bytes = total_bytes.saturating_add(bytes);
+            total_items += items;
+
+            for sf in subfolders {
+                if folders_visited + queue.len() < max_folders {
+                    queue.push_back(sf);
+                }
+            }
+
+            // Stream live progressive update to UI if at least 150ms has elapsed
+            if last_ui_update.elapsed() >= std::time::Duration::from_millis(150) {
+                last_ui_update = std::time::Instant::now();
+                let _ = tx
+                    .send(Event::Action(Action::PreviewMetadataLoaded {
+                        id: folder_id.to_string(),
+                        name: folder_name.to_string(),
+                        size: Some(total_bytes),
+                        items_count: Some(total_items),
+                        is_calculating: true,
+                        created: created.to_string(),
+                        modified: modified.to_string(),
+                    }))
+                    .await;
+            }
+        }
+    }
+
+    (Some(total_bytes), Some(total_items))
+}
+
+pub async fn calculate_shared_with_me_size(
+    client: &Client,
+    access_token: &str,
+    tx: &mpsc::Sender<Event>,
+    file_id: &str,
+    folder_name: &str,
+    created: &str,
+    modified: &str,
+) -> (Option<u64>, Option<usize>) {
+    use futures_util::stream::FuturesUnordered;
+    use futures_util::StreamExt;
+
+    let mut total_bytes: u64 = 0;
+    let mut total_items: usize = 0;
+    let mut page_token: Option<String> = None;
+    let mut queue = std::collections::VecDeque::new();
+    let start_time = std::time::Instant::now();
+    let max_duration = std::time::Duration::from_secs(120);
+    let mut last_ui_update = std::time::Instant::now();
+
+    loop {
+        if start_time.elapsed() >= max_duration {
+            break;
+        }
+
+        let pt_clone = page_token.clone();
+        let token = access_token.to_string();
+        let c = client.clone();
+
+        let res = match send_with_retry(
+            move || {
+                let mut r = c
+                    .get("https://www.googleapis.com/drive/v3/files")
+                    .bearer_auth(&token)
+                    .query(&[
+                        ("q", "sharedWithMe = true and trashed = false".to_string()),
+                        (
+                            "fields",
+                            "nextPageToken,files(id,mimeType,size)".to_string(),
+                        ),
+                        ("pageSize", "1000".to_string()),
+                        ("supportsAllDrives", "true".to_string()),
+                        ("includeItemsFromAllDrives", "true".to_string()),
+                    ]);
+                if let Some(ref pt) = pt_clone {
+                    r = r.query(&[("pageToken", pt)]);
+                }
+                r
+            },
+            3,
+        )
+        .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => break,
+        };
+
+        let data = match res.json::<FolderChildrenResponse>().await {
+            Ok(d) => d,
+            Err(_) => break,
+        };
+
+        if let Some(files) = data.files {
+            for item in files {
+                total_items += 1;
+                if item
+                    .mime_type
+                    .as_deref()
+                    .is_some_and(|m| m == "application/vnd.google-apps.folder")
+                {
+                    queue.push_back(item.id);
+                } else if let Some(ref sz_str) = item.size {
+                    if let Ok(sz) = sz_str.parse::<u64>() {
+                        total_bytes = total_bytes.saturating_add(sz);
+                    }
+                }
+            }
+        }
+
+        if last_ui_update.elapsed() >= std::time::Duration::from_millis(150) {
+            last_ui_update = std::time::Instant::now();
+            let _ = tx
+                .send(Event::Action(Action::PreviewMetadataLoaded {
+                    id: file_id.to_string(),
+                    name: folder_name.to_string(),
+                    size: Some(total_bytes),
+                    items_count: Some(total_items),
+                    is_calculating: true,
+                    created: created.to_string(),
+                    modified: modified.to_string(),
+                }))
+                .await;
+        }
+
+        page_token = data.next_page_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+
+    // Now recursively traverse any subfolders in shared items
+    let mut in_flight = FuturesUnordered::new();
+    let max_concurrency = 6;
+    let mut folders_visited = 0;
+    let max_folders = 5000;
+
+    while !queue.is_empty() || !in_flight.is_empty() {
+        if start_time.elapsed() >= max_duration || folders_visited >= max_folders {
+            break;
+        }
+
+        while in_flight.len() < max_concurrency && folders_visited < max_folders {
+            if let Some(next_id) = queue.pop_front() {
+                folders_visited += 1;
+                let c = client.clone();
+                let tok = access_token.to_string();
+                in_flight.push(async move { fetch_folder_children(&c, &tok, &next_id).await });
+            } else {
+                break;
+            }
+        }
+
+        if let Some((subfolders, bytes, items)) = in_flight.next().await {
+            total_bytes = total_bytes.saturating_add(bytes);
+            total_items += items;
+
+            for sf in subfolders {
+                if folders_visited + queue.len() < max_folders {
+                    queue.push_back(sf);
+                }
+            }
+
+            if last_ui_update.elapsed() >= std::time::Duration::from_millis(150) {
+                last_ui_update = std::time::Instant::now();
+                let _ = tx
+                    .send(Event::Action(Action::PreviewMetadataLoaded {
+                        id: file_id.to_string(),
+                        name: folder_name.to_string(),
+                        size: Some(total_bytes),
+                        items_count: Some(total_items),
+                        is_calculating: true,
+                        created: created.to_string(),
+                        modified: modified.to_string(),
+                    }))
+                    .await;
+            }
+        }
+    }
+
+    (Some(total_bytes), Some(total_items))
 }
 
 pub async fn update_resume_time(
@@ -898,5 +1352,109 @@ mod tests {
                 vec![]
             )
         );
+    }
+
+    #[test]
+    fn test_sort_files_folders_first_and_alphabetical() {
+        let mut files = vec![
+            DriveFile {
+                id: "1".to_string(),
+                name: "zebra.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                app_properties: None,
+            },
+            DriveFile {
+                id: "2".to_string(),
+                name: "Beta Folder".to_string(),
+                mime_type: "application/vnd.google-apps.folder".to_string(),
+                app_properties: None,
+            },
+            DriveFile {
+                id: "3".to_string(),
+                name: "apple.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                app_properties: None,
+            },
+            DriveFile {
+                id: "4".to_string(),
+                name: "alpha folder".to_string(),
+                mime_type: "application/vnd.google-apps.folder".to_string(),
+                app_properties: None,
+            },
+            DriveFile {
+                id: "5".to_string(),
+                name: "Banana.pdf".to_string(),
+                mime_type: "application/pdf".to_string(),
+                app_properties: None,
+            },
+        ];
+
+        sort_files(&mut files);
+
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "alpha folder",
+                "Beta Folder",
+                "apple.txt",
+                "Banana.pdf",
+                "zebra.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_file_list_response_deserialization() {
+        let json_with_token = r#"{
+            "nextPageToken": "token_page_2",
+            "files": [
+                {
+                    "id": "file123",
+                    "name": "Doc.pdf",
+                    "mimeType": "application/pdf"
+                }
+            ]
+        }"#;
+
+        let resp: FileListResponse = serde_json::from_str(json_with_token).unwrap();
+        assert_eq!(resp.next_page_token, Some("token_page_2".to_string()));
+        assert_eq!(resp.files.len(), 1);
+        assert_eq!(resp.files[0].name, "Doc.pdf");
+
+        let json_without_token = r#"{
+            "files": []
+        }"#;
+
+        let resp_empty: FileListResponse = serde_json::from_str(json_without_token).unwrap();
+        assert!(resp_empty.next_page_token.is_none());
+        assert!(resp_empty.files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_metadata_shared_with_me() {
+        let client = reqwest::Client::new();
+        let (tx, mut rx) = mpsc::channel(2);
+        fetch_metadata(
+            client,
+            "dummy_token".to_string(),
+            "shared_with_me".to_string(),
+            tx,
+        )
+        .await;
+
+        if let Some(crate::tui::state::Event::Action(
+            crate::tui::state::Action::PreviewMetadataLoaded {
+                name,
+                is_calculating,
+                ..
+            },
+        )) = rx.recv().await
+        {
+            assert_eq!(name, "Shared with me");
+            assert!(is_calculating);
+        } else {
+            panic!("Expected PreviewMetadataLoaded action");
+        }
     }
 }

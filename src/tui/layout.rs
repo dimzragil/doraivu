@@ -367,6 +367,8 @@ fn render_preview_panel(
         PreviewState::Metadata {
             name,
             size,
+            items_count,
+            is_calculating,
             created,
             modified,
         } => {
@@ -374,6 +376,22 @@ fn render_preview_panel(
                 .borders(Borders::ALL)
                 .title(" Metadata ")
                 .border_style(Style::default().fg(theme_color));
+            let size_str = if *is_calculating {
+                "Calculating...".to_string()
+            } else {
+                match (size, items_count) {
+                    (Some(s), Some(count)) => {
+                        let item_word = if *count == 1 { "item" } else { "items" };
+                        format!("{} ({} {})", format_bytes(*s), count, item_word)
+                    }
+                    (Some(s), None) => format_bytes(*s),
+                    (None, Some(count)) => {
+                        let item_word = if *count == 1 { "item" } else { "items" };
+                        format!("- ({} {})", count, item_word)
+                    }
+                    (None, None) => "-".to_string(),
+                }
+            };
             let text = vec![
                 Line::from(vec![
                     Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -381,11 +399,7 @@ fn render_preview_panel(
                 ]),
                 Line::from(vec![
                     Span::styled("Size: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(if let Some(s) = size {
-                        format_bytes(*s)
-                    } else {
-                        "-".to_string()
-                    }),
+                    Span::raw(size_str),
                 ]),
                 Line::from(vec![
                     Span::styled("Created: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -519,18 +533,35 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     };
 
     // Left: Status / Search / Progress Gauge
-    let dl_reconnecting = app
-        .download
-        .manager
-        .queue
-        .iter()
-        .any(|task| task.status == DownloadStatus::Reconnecting);
-    let ul_reconnecting = app
-        .upload
-        .manager
-        .queue
-        .iter()
-        .any(|task| task.status == UploadStatus::Reconnecting);
+    let is_dl_active = app.download.progress.is_some()
+        || app
+            .download
+            .manager
+            .queue
+            .iter()
+            .any(|task| task.status == DownloadStatus::Downloading);
+    let is_ul_active = app.upload.progress.is_some()
+        || app
+            .upload
+            .manager
+            .queue
+            .iter()
+            .any(|task| task.status == UploadStatus::Uploading);
+
+    let dl_reconnecting = !is_dl_active
+        && app
+            .download
+            .manager
+            .queue
+            .iter()
+            .any(|task| task.status == DownloadStatus::Reconnecting);
+    let ul_reconnecting = !is_ul_active
+        && app
+            .upload
+            .manager
+            .queue
+            .iter()
+            .any(|task| task.status == UploadStatus::Reconnecting);
 
     if dl_reconnecting {
         let warning_block = Paragraph::new(" [⚠ Reconnecting...] Retrying download...")
@@ -789,7 +820,9 @@ fn render_modals(f: &mut Frame, app: &App) {
 
             let block = Block::default()
                 .title(" Upload File ")
-                .title_bottom(Line::from(" [Tab] Switch ").alignment(Alignment::Left))
+                .title_bottom(
+                    Line::from(" [Esc] Cancel | [Tab] Switch ").alignment(Alignment::Left),
+                )
                 .title_bottom(Line::from(" [Enter] Upload ").alignment(Alignment::Right))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme_color));
@@ -812,7 +845,21 @@ fn render_modals(f: &mut Frame, app: &App) {
                 Style::default()
             };
 
-            let p1 = Paragraph::new(app.upload.target_id.as_str())
+            let inner_width0 = modal_chunks[0].width.saturating_sub(2) as usize;
+            let (target_visible, target_col) = crate::tui::input::compute_visible_input(
+                &app.upload.target_id,
+                app.upload.target_cursor,
+                inner_width0,
+            );
+
+            let inner_width1 = modal_chunks[1].width.saturating_sub(2) as usize;
+            let (local_visible, local_col) = crate::tui::input::compute_visible_input(
+                &app.upload.local_path,
+                app.upload.local_cursor,
+                inner_width1,
+            );
+
+            let p1 = Paragraph::new(target_visible)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -825,7 +872,7 @@ fn render_modals(f: &mut Frame, app: &App) {
                 )
                 .style(target_style);
 
-            let p2 = Paragraph::new(app.upload.local_path.as_str())
+            let p2 = Paragraph::new(local_visible)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -840,34 +887,72 @@ fn render_modals(f: &mut Frame, app: &App) {
 
             f.render_widget(p1, modal_chunks[0]);
             f.render_widget(p2, modal_chunks[1]);
+
+            if app.upload.input_idx == 0 {
+                f.set_cursor_position((
+                    modal_chunks[0].x + 1 + target_col as u16,
+                    modal_chunks[0].y + 1,
+                ));
+            } else {
+                f.set_cursor_position((
+                    modal_chunks[1].x + 1 + local_col as u16,
+                    modal_chunks[1].y + 1,
+                ));
+            }
         }
         InputMode::RenameModal => {
             let area = centered_rect(50, 3, f.area());
             f.render_widget(Clear, area);
 
-            let popup = Paragraph::new(format!("{}█", app.rename.buffer))
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let (visible, col) = crate::tui::input::compute_visible_input(
+                &app.rename.buffer,
+                app.rename.cursor,
+                inner_width,
+            );
+
+            let popup = Paragraph::new(visible)
                 .block(
                     Block::default()
                         .title(" [ Rename ] ")
+                        .title_bottom(
+                            Line::from(" [Esc] Cancel | [Enter] Submit ")
+                                .alignment(Alignment::Right),
+                        )
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Yellow)),
                 )
                 .style(Style::default().fg(Color::Yellow));
             f.render_widget(popup, area);
+
+            f.set_cursor_position((area.x + 1 + col as u16, area.y + 1));
         }
         InputMode::NewFolderModal => {
             let area = centered_rect(50, 3, f.area());
             f.render_widget(Clear, area);
 
-            let popup = Paragraph::new(format!("{}█", app.new_folder_buffer))
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let (visible, col) = crate::tui::input::compute_visible_input(
+                &app.new_folder_buffer,
+                app.new_folder_cursor,
+                inner_width,
+            );
+
+            let popup = Paragraph::new(visible)
                 .block(
                     Block::default()
                         .title(" [ Create New Folder ] ")
+                        .title_bottom(
+                            Line::from(" [Esc] Cancel | [Enter] Create ")
+                                .alignment(Alignment::Right),
+                        )
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Yellow)),
                 )
                 .style(Style::default().fg(Color::Yellow));
             f.render_widget(popup, area);
+
+            f.set_cursor_position((area.x + 1 + col as u16, area.y + 1));
         }
         _ => {}
     }

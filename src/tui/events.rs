@@ -68,15 +68,14 @@ fn handle_rename_modal_keys(
     match key.code {
         KeyCode::Esc => {
             app.rename.buffer.clear();
+            app.rename.cursor = 0;
             app.rename.target_id.clear();
             app.input_mode = state::InputMode::Normal;
-        }
-        KeyCode::Backspace => {
-            app.rename.buffer.pop();
         }
         KeyCode::Enter => {
             let file_id = std::mem::take(&mut app.rename.target_id);
             let new_name = std::mem::take(&mut app.rename.buffer);
+            app.rename.cursor = 0;
             app.input_mode = state::InputMode::Normal;
 
             if file_id.is_empty() {
@@ -91,10 +90,13 @@ fn handle_rename_modal_keys(
                 rename_file(c, t, file_id, new_name, txc).await;
             });
         }
-        KeyCode::Char(c) => {
-            app.rename.buffer.push(c);
+        _ => {
+            crate::tui::input::handle_input_key(
+                &mut app.rename.buffer,
+                &mut app.rename.cursor,
+                key,
+            );
         }
-        _ => {}
     }
 }
 
@@ -112,15 +114,14 @@ fn handle_new_folder_modal_keys(
     match key.code {
         KeyCode::Esc => {
             app.new_folder_buffer.clear();
+            app.new_folder_cursor = 0;
             app.input_mode = state::InputMode::Normal;
-        }
-        KeyCode::Backspace => {
-            app.new_folder_buffer.pop();
         }
         KeyCode::Enter => {
             let folder_name = std::mem::take(&mut app.new_folder_buffer)
                 .trim()
                 .to_string();
+            app.new_folder_cursor = 0;
             app.input_mode = state::InputMode::Normal;
 
             if folder_name.is_empty() {
@@ -149,10 +150,13 @@ fn handle_new_folder_modal_keys(
                 create_folder(c, t, folder_name, parent_id, txc).await;
             });
         }
-        KeyCode::Char(c) => {
-            app.new_folder_buffer.push(c);
+        _ => {
+            crate::tui::input::handle_input_key(
+                &mut app.new_folder_buffer,
+                &mut app.new_folder_cursor,
+                key,
+            );
         }
-        _ => {}
     }
 }
 
@@ -408,6 +412,7 @@ fn handle_upload_tracker_keys(
                         if let Some(handle) = app.upload.active_task.take() {
                             handle.abort();
                         }
+                        app.upload.progress = None;
                     }
                     app.upload.manager.queue.remove(i);
                     if app.upload.manager.queue.is_empty() {
@@ -419,62 +424,49 @@ fn handle_upload_tracker_keys(
                             .select(Some(i.min(app.upload.manager.queue.len() - 1)));
                     }
 
-                    if let Some(first) = app
+                    let is_active_running = app
                         .upload
-                        .manager
-                        .queue
-                        .iter_mut()
-                        .find(|t| t.status == models::UploadStatus::Pending)
-                    {
-                        first.status = models::UploadStatus::Uploading;
-                        let task_clone = first.clone();
-                        let client_c = client.clone();
-                        let token_c = token.access_token.clone();
-                        let tx_c = tx.clone();
-                        app.upload.active_task = Some(tokio::spawn(async move {
-                            upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
-                        }));
+                        .active_task
+                        .as_ref()
+                        .is_some_and(|h| !h.is_finished());
+                    if !is_active_running {
+                        if let Some(first) = app
+                            .upload
+                            .manager
+                            .queue
+                            .iter_mut()
+                            .find(|t| t.status == models::UploadStatus::Pending)
+                        {
+                            first.status = models::UploadStatus::Uploading;
+                            let task_clone = first.clone();
+                            let client_c = client.clone();
+                            let token_c = token.access_token.clone();
+                            let tx_c = tx.clone();
+                            if let Some(h) = app.upload.active_task.take() {
+                                h.abort();
+                            }
+                            app.upload.active_task = Some(tokio::spawn(async move {
+                                upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
+                            }));
+                        }
                     }
                 }
             }
         }
         KeyCode::Char('p') => {
             if let Some(i) = app.upload.manager.state.selected() {
-                if i < app.upload.manager.queue.len()
-                    && (app.upload.manager.queue[i].status == models::UploadStatus::Uploading
-                        || app.upload.manager.queue[i].status == models::UploadStatus::Reconnecting)
-                {
-                    app.upload.manager.queue[i].status = models::UploadStatus::Paused;
-                    if let Some(handle) = app.upload.active_task.take() {
-                        handle.abort();
-                    }
-
-                    if let Some(first) = app
-                        .upload
-                        .manager
-                        .queue
-                        .iter_mut()
-                        .find(|t| t.status == models::UploadStatus::Pending)
+                if i < app.upload.manager.queue.len() {
+                    let item = &mut app.upload.manager.queue[i];
+                    if item.status == models::UploadStatus::Uploading
+                        || item.status == models::UploadStatus::Reconnecting
                     {
-                        first.status = models::UploadStatus::Uploading;
-                        let task_clone = first.clone();
-                        let client_c = client.clone();
-                        let token_c = token.access_token.clone();
-                        let tx_c = tx.clone();
-                        app.upload.active_task = Some(tokio::spawn(async move {
-                            upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
-                        }));
-                    }
-                }
-            }
-        }
-        KeyCode::Char('r') => {
-            if let Some(i) = app.upload.manager.state.selected() {
-                if i < app.upload.manager.queue.len()
-                    && app.upload.manager.queue[i].status == models::UploadStatus::Paused
-                {
-                    app.upload.manager.queue[i].status = models::UploadStatus::Pending;
-                    if app.upload.active_task.is_none() {
+                        item.status = models::UploadStatus::Paused;
+                        if let Some(handle) = app.upload.active_task.take() {
+                            handle.abort();
+                        }
+                        app.upload.progress = None;
+                        app.status = "Upload paused.".into();
+
                         if let Some(first) = app
                             .upload
                             .manager
@@ -490,6 +482,60 @@ fn handle_upload_tracker_keys(
                             app.upload.active_task = Some(tokio::spawn(async move {
                                 upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
                             }));
+                        }
+                    } else if item.status == models::UploadStatus::Pending {
+                        item.status = models::UploadStatus::Paused;
+                        app.status = "Upload paused.".into();
+                    }
+                }
+            }
+        }
+        KeyCode::Char('r') => {
+            if let Some(i) = app.upload.manager.state.selected() {
+                if i < app.upload.manager.queue.len() {
+                    let is_active_running = app
+                        .upload
+                        .active_task
+                        .as_ref()
+                        .is_some_and(|h| !h.is_finished());
+
+                    let item = &mut app.upload.manager.queue[i];
+                    match item.status {
+                        models::UploadStatus::Reconnecting | models::UploadStatus::Uploading => {
+                            if let Some(h) = app.upload.active_task.take() {
+                                h.abort();
+                            }
+                            item.status = models::UploadStatus::Uploading;
+                            app.upload.progress = None;
+                            app.status = format!("Restarting/resuming upload for {}...", item.name);
+                            let task_clone = item.clone();
+                            let client_c = client.clone();
+                            let token_c = token.access_token.clone();
+                            let tx_c = tx.clone();
+                            app.upload.active_task = Some(tokio::spawn(async move {
+                                upload::upload_file_task(client_c, token_c, task_clone, tx_c).await;
+                            }));
+                        }
+                        models::UploadStatus::Paused | models::UploadStatus::Pending => {
+                            if is_active_running {
+                                item.status = models::UploadStatus::Pending;
+                                app.status = "Upload queued for resume.".into();
+                            } else {
+                                if let Some(h) = app.upload.active_task.take() {
+                                    h.abort();
+                                }
+                                item.status = models::UploadStatus::Uploading;
+                                app.upload.progress = None;
+                                app.status = format!("Resuming upload for {}...", item.name);
+                                let task_clone = item.clone();
+                                let client_c = client.clone();
+                                let token_c = token.access_token.clone();
+                                let tx_c = tx.clone();
+                                app.upload.active_task = Some(tokio::spawn(async move {
+                                    upload::upload_file_task(client_c, token_c, task_clone, tx_c)
+                                        .await;
+                                }));
+                            }
                         }
                     }
                 }
@@ -544,16 +590,30 @@ fn handle_download_tracker_keys(
                         if let Some(task) = app.download.active_task.take() {
                             task.abort();
                         }
+                        app.download.progress = None;
                     }
                     app.download.manager.queue.remove(i);
+                    if app.download.manager.queue.is_empty() {
+                        app.download.manager.state.select(None);
+                    } else {
+                        app.download
+                            .manager
+                            .state
+                            .select(Some(i.min(app.download.manager.queue.len() - 1)));
+                    }
 
-                    if app.download.active_task.is_none() {
+                    let is_active_running = app
+                        .download
+                        .active_task
+                        .as_ref()
+                        .is_some_and(|h| !h.is_finished());
+                    if !is_active_running {
                         if let Some(first) = app
                             .download
                             .manager
                             .queue
                             .iter_mut()
-                            .find(|t| t.status != models::DownloadStatus::Paused)
+                            .find(|t| t.status == models::DownloadStatus::Pending)
                         {
                             first.status = models::DownloadStatus::Downloading;
                             let c = client.clone();
@@ -561,6 +621,9 @@ fn handle_download_tracker_keys(
                             let txc = tx.clone();
                             let f = first.file.clone();
                             let start_bytes = first.downloaded_bytes;
+                            if let Some(h) = app.download.active_task.take() {
+                                h.abort();
+                            }
                             app.download.active_task = Some(tokio::spawn(async move {
                                 crate::drive::download::download_file_ranged(
                                     c,
@@ -586,6 +649,7 @@ fn handle_download_tracker_keys(
                         if let Some(task) = app.download.active_task.take() {
                             task.abort();
                         }
+                        app.download.progress = None;
                         app.status = "Download paused.".into();
 
                         if let Some(first) = app
@@ -612,6 +676,9 @@ fn handle_download_tracker_keys(
                                 .await;
                             }));
                         }
+                    } else if item.status == models::DownloadStatus::Pending {
+                        item.status = models::DownloadStatus::Paused;
+                        app.status = "Download paused.".into();
                     }
                 }
             }
@@ -619,12 +686,22 @@ fn handle_download_tracker_keys(
         KeyCode::Char('r') => {
             if let Some(i) = app.download.manager.state.selected() {
                 if let Some(item) = app.download.manager.queue.get_mut(i) {
-                    if item.status == models::DownloadStatus::Paused {
-                        item.status = models::DownloadStatus::Pending;
-                        app.status = "Download queued for resume.".into();
+                    let is_active_running = app
+                        .download
+                        .active_task
+                        .as_ref()
+                        .is_some_and(|h| !h.is_finished());
 
-                        if app.download.active_task.is_none() {
+                    match item.status {
+                        models::DownloadStatus::Reconnecting
+                        | models::DownloadStatus::Downloading => {
+                            if let Some(h) = app.download.active_task.take() {
+                                h.abort();
+                            }
                             item.status = models::DownloadStatus::Downloading;
+                            app.download.progress = None;
+                            app.status =
+                                format!("Restarting/resuming download for {}...", item.file.name);
                             let c = client.clone();
                             let t = token.access_token.clone();
                             let txc = tx.clone();
@@ -640,6 +717,34 @@ fn handle_download_tracker_keys(
                                 )
                                 .await;
                             }));
+                        }
+                        models::DownloadStatus::Paused | models::DownloadStatus::Pending => {
+                            if is_active_running {
+                                item.status = models::DownloadStatus::Pending;
+                                app.status = "Download queued for resume.".into();
+                            } else {
+                                if let Some(h) = app.download.active_task.take() {
+                                    h.abort();
+                                }
+                                item.status = models::DownloadStatus::Downloading;
+                                app.download.progress = None;
+                                app.status = format!("Resuming download for {}...", item.file.name);
+                                let c = client.clone();
+                                let t = token.access_token.clone();
+                                let txc = tx.clone();
+                                let f = item.file.clone();
+                                let start_bytes = item.downloaded_bytes;
+                                app.download.active_task = Some(tokio::spawn(async move {
+                                    crate::drive::download::download_file_ranged(
+                                        c,
+                                        t,
+                                        f,
+                                        start_bytes,
+                                        txc,
+                                    )
+                                    .await;
+                                }));
+                            }
                         }
                     }
                 }
@@ -664,7 +769,7 @@ fn handle_upload_modal_keys(
         KeyCode::Esc => {
             app.input_mode = state::InputMode::Normal;
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab => {
             app.upload.input_idx = (app.upload.input_idx + 1) % 2;
         }
         KeyCode::Enter => {
@@ -702,6 +807,7 @@ fn handle_upload_modal_keys(
             app.upload.progress = Some((0, 0, 0.0));
             app.input_mode = state::InputMode::Normal;
             app.upload.local_path.clear();
+            app.upload.local_cursor = 0;
             let c = client.clone();
             let t = token.access_token.clone();
             let txc = tx.clone();
@@ -709,21 +815,14 @@ fn handle_upload_modal_keys(
                 upload_file(c, t, parent, path, txc).await;
             });
         }
-        KeyCode::Backspace => {
-            if app.upload.input_idx == 0 {
-                app.upload.target_id.pop();
+        _ => {
+            let (text, cursor) = if app.upload.input_idx == 0 {
+                (&mut app.upload.target_id, &mut app.upload.target_cursor)
             } else {
-                app.upload.local_path.pop();
-            }
+                (&mut app.upload.local_path, &mut app.upload.local_cursor)
+            };
+            crate::tui::input::handle_input_key(text, cursor, key);
         }
-        KeyCode::Char(c) => {
-            if app.upload.input_idx == 0 {
-                app.upload.target_id.push(c);
-            } else {
-                app.upload.local_path.push(c);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -831,6 +930,11 @@ fn handle_normal_keys(
                     _ => state::PreviewMode::Hidden,
                 };
             }
+            if app.preview.mode == state::PreviewMode::Hidden {
+                if let Some(h) = app.preview.active_task.take() {
+                    h.abort();
+                }
+            }
             trigger_preview(app, client, &token.access_token, tx);
         }
         KeyCode::Char('r') => {
@@ -864,12 +968,14 @@ fn handle_normal_keys(
                 return;
             }
             app.new_folder_buffer.clear();
+            app.new_folder_cursor = 0;
             app.input_mode = state::InputMode::NewFolderModal;
         }
         KeyCode::Char('c') => {
             if let Some(file) = app.selected_file().cloned() {
                 app.rename.target_id = file.id;
                 app.rename.buffer = file.name;
+                app.rename.cursor = app.rename.buffer.chars().count();
                 app.input_mode = state::InputMode::RenameModal;
             }
         }
@@ -1135,6 +1241,7 @@ fn handle_normal_keys(
             } else {
                 app.upload.target_id = format!("/{}", app.nav.path_names[1..].join("/"));
             }
+            app.upload.target_cursor = app.upload.target_id.chars().count();
             app.upload.input_idx = 1;
             let home = directories::UserDirs::new()
                 .map(|u| u.home_dir().to_string_lossy().to_string())
@@ -1144,6 +1251,7 @@ fn handle_normal_keys(
             } else {
                 format!("{}/", home)
             };
+            app.upload.local_cursor = app.upload.local_path.chars().count();
         }
         KeyCode::Char('a') => {
             if let Some(file) = app.selected_file() {

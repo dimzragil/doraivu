@@ -32,6 +32,15 @@ impl DriveFile {
     }
 }
 
+/// Response structure for Drive Files.list endpoint with pagination support
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileListResponse {
+    pub files: Vec<DriveFile>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum UploadStatus {
     Pending,

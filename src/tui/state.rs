@@ -13,6 +13,8 @@ pub enum PreviewState {
     Metadata {
         name: String,
         size: Option<u64>,
+        items_count: Option<usize>,
+        is_calculating: bool,
         created: String,
         modified: String,
     },
@@ -28,7 +30,15 @@ pub enum Action {
     LoadQuota(u64, u64), // (used, limit)
     UploadComplete(String),
     ImagePreview(Vec<u8>),
-    PreviewMetadataLoaded(String, Option<u64>, String, String),
+    PreviewMetadataLoaded {
+        id: String,
+        name: String,
+        size: Option<u64>,
+        items_count: Option<usize>,
+        is_calculating: bool,
+        created: String,
+        modified: String,
+    },
     QueueUploads(Vec<UploadTask>),
     TokenRefreshed(crate::drive::auth::Token),
     TokenRefreshFailed,
@@ -41,6 +51,10 @@ pub enum Action {
     UpdateResumeTime(String, String),              // (id, resume_time)
     SetDownloadReconnecting(String),               // id
     SetUploadReconnecting(String),                 // local_path
+    SetDownloadDownloading(String),                // id
+    SetUploadUploading(String),                    // local_path
+    DownloadFailed(String, String),                // id, error_msg
+    UploadFailed(String, String),                  // local_path, error_msg
     RefreshFolder(String),                         // target_folder_id
     ClearClipboard,
 }
@@ -90,7 +104,9 @@ pub struct UploadState {
     pub active_task: Option<tokio::task::JoinHandle<()>>,
     pub progress: Option<(u64, u64, f64)>,
     pub target_id: String,
+    pub target_cursor: usize,
     pub local_path: String,
+    pub local_cursor: usize,
     pub input_idx: usize,
 }
 
@@ -101,7 +117,9 @@ impl Default for UploadState {
             active_task: None,
             progress: None,
             target_id: String::new(),
+            target_cursor: 0,
             local_path: String::new(),
+            local_cursor: 0,
             input_idx: 1,
         }
     }
@@ -111,6 +129,7 @@ impl Default for UploadState {
 #[derive(Default)]
 pub struct RenameState {
     pub buffer: String,
+    pub cursor: usize,
     pub target_id: String,
 }
 
@@ -127,6 +146,7 @@ pub struct PreviewContext {
     pub state: PreviewState,
     pub dims: Option<(u32, u32)>,
     pub picker: ratatui_image::picker::Picker,
+    pub active_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for PreviewContext {
@@ -137,6 +157,7 @@ impl Default for PreviewContext {
             dims: None,
             picker: ratatui_image::picker::Picker::from_query_stdio()
                 .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks()),
+            active_task: None,
         }
     }
 }
@@ -194,6 +215,7 @@ pub struct App {
     pub is_refreshing_token: bool,
     pub clipboard: Option<Clipboard>,
     pub new_folder_buffer: String,
+    pub new_folder_cursor: usize,
 
     // Grouped sub-states
     pub download: DownloadState,
@@ -282,6 +304,7 @@ impl App {
             is_refreshing_token: false,
             clipboard: None,
             new_folder_buffer: String::new(),
+            new_folder_cursor: 0,
             download: DownloadState::default(),
             upload: UploadState::default(),
             rename: RenameState::default(),
