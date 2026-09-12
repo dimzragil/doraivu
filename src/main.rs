@@ -3,6 +3,8 @@ mod drive;
 mod tui;
 
 use anyhow::Result;
+use clap::Parser;
+use cli::{Cli, Commands};
 use crossterm::{
     event::{self, Event as CEvent},
     execute,
@@ -14,7 +16,8 @@ use drive::models::DriveFile;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use reqwest::Client;
 use std::{
-    env, io,
+    env,
+    io::{self, IsTerminal, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -30,18 +33,31 @@ use tui::state::{Action, App, Event};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut arg_client_id = None;
-    let mut arg_client_secret = None;
-    for arg in env::args().skip(1) {
-        if let Some(val) = arg.strip_prefix("GOOGLE_CLIENT_ID=") {
-            arg_client_id = Some(val.to_string());
-        } else if let Some(val) = arg.strip_prefix("GOOGLE_CLIENT_SECRET=") {
-            arg_client_secret = Some(val.to_string());
+    // Map legacy GOOGLE_CLIENT_ID=... / GOOGLE_CLIENT_SECRET=... args to clap flags
+    let raw_args: Vec<String> = env::args()
+        .map(|arg| {
+            if let Some(val) = arg.strip_prefix("GOOGLE_CLIENT_ID=") {
+                format!("--client-id={}", val)
+            } else if let Some(val) = arg.strip_prefix("GOOGLE_CLIENT_SECRET=") {
+                format!("--client-secret={}", val)
+            } else {
+                arg
+            }
+        })
+        .collect();
+
+    let cli_args = Cli::parse_from(raw_args);
+
+    if let Some(command) = cli_args.command {
+        match command {
+            Commands::Setup => return cli::setup::run().await,
+            Commands::Login => return cli::login::run().await,
+            Commands::Logout => return cli::logout::run().await,
         }
     }
 
     let auth_info = if let (Some(client_id), Some(client_secret)) =
-        (arg_client_id, arg_client_secret)
+        (cli_args.client_id, cli_args.client_secret)
     {
         let info = AuthInfo {
             client_id,
@@ -49,7 +65,7 @@ async fn main() -> Result<()> {
         };
         let _ = auth::save_credentials(&info);
         // Force re-login if credentials changed
-        let _ = std::fs::remove_file(auth::get_token_path().unwrap_or_default());
+        let _ = auth::clear_token();
         info
     } else {
         match auth::load_credentials() {
@@ -59,14 +75,31 @@ async fn main() -> Result<()> {
                 let client_secret =
                     env::var("GOOGLE_CLIENT_SECRET").unwrap_or_else(|_| "".to_string());
                 if client_id.is_empty() || client_secret.is_empty() {
-                    anyhow::bail!("No credentials found.\nPlease run: doraivu GOOGLE_CLIENT_ID=\"...\" GOOGLE_CLIENT_SECRET=\"...\"");
+                    if io::stdin().is_terminal() {
+                        println!("No Google Drive credentials configured.");
+                        print!("Would you like to run setup now? [Y/n]: ");
+                        io::stdout().flush()?;
+                        let mut ans = String::new();
+                        if io::stdin().read_line(&mut ans)? == 0 || ans.trim().eq_ignore_ascii_case("n") {
+                            println!("Run 'doraivu setup' when you are ready to configure.");
+                            return Ok(());
+                        }
+                        cli::setup::run().await?;
+                        match auth::load_credentials() {
+                            Ok(Some(info)) => info,
+                            _ => return Ok(()),
+                        }
+                    } else {
+                        anyhow::bail!("No credentials found.\nPlease run: doraivu setup");
+                    }
+                } else {
+                    let info = AuthInfo {
+                        client_id,
+                        client_secret,
+                    };
+                    let _ = auth::save_credentials(&info);
+                    info
                 }
-                let info = AuthInfo {
-                    client_id,
-                    client_secret,
-                };
-                let _ = auth::save_credentials(&info);
-                info
             }
         }
     };

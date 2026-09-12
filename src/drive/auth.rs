@@ -84,6 +84,107 @@ pub fn save_token(token: &Token) -> Result<()> {
     Ok(())
 }
 
+pub fn clear_token() -> Result<()> {
+    let path = get_token_path()?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+pub fn clear_credentials() -> Result<()> {
+    let path = get_credentials_path()?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+const GOOGLE_REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
+
+pub async fn revoke_token(client: &Client) -> Result<()> {
+    if let Ok(Some(token)) = load_token() {
+        let token_to_revoke = token.refresh_token.as_ref().unwrap_or(&token.access_token);
+        let _ = client
+            .post(GOOGLE_REVOKE_URL)
+            .form(&[("token", token_to_revoke.as_str())])
+            .send()
+            .await;
+    }
+    clear_token()?;
+    Ok(())
+}
+
+pub fn mask_client_id(client_id: &str) -> String {
+    if client_id.len() <= 12 {
+        "***".to_string()
+    } else {
+        let prefix = &client_id[..6.min(client_id.len())];
+        let suffix = if client_id.ends_with(".apps.googleusercontent.com") {
+            "...apps.googleusercontent.com"
+        } else {
+            let start = client_id.len().saturating_sub(6);
+            &client_id[start..]
+        };
+        format!("{}***{}", prefix, suffix)
+    }
+}
+
+pub async fn validate_credentials(client: &Client, auth_info: &AuthInfo) -> Result<()> {
+    let client_id = auth_info.client_id.trim();
+    let client_secret = auth_info.client_secret.trim();
+
+    if client_id.is_empty() {
+        anyhow::bail!("Client ID cannot be empty.");
+    }
+    if !client_id.ends_with(".apps.googleusercontent.com") {
+        anyhow::bail!("Invalid Client ID format: must end with '.apps.googleusercontent.com'");
+    }
+    if client_secret.is_empty() {
+        anyhow::bail!("Client Secret cannot be empty.");
+    }
+    if client_secret.contains(char::is_whitespace) {
+        anyhow::bail!("Client Secret cannot contain whitespace.");
+    }
+
+    // Preflight request to Google token endpoint to check credentials
+    let res = client
+        .post(GOOGLE_TOKEN_URL)
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("grant_type", "authorization_code"),
+            ("code", "preflight_probe"),
+            ("redirect_uri", "http://127.0.0.1"),
+        ])
+        .send()
+        .await;
+
+    match res {
+        Ok(response) => {
+            if let Ok(body) = response.json::<serde_json::Value>().await {
+                if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                    if err == "invalid_client" {
+                        let desc = body
+                            .get("error_description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Invalid Client ID or Client Secret.");
+                        anyhow::bail!("Google rejected credentials: {}", desc);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: Could not connect to Google OAuth servers to verify credentials: {}",
+                e
+            );
+        }
+    }
+
+    Ok(())
+}
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
