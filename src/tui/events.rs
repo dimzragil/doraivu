@@ -1271,7 +1271,8 @@ fn handle_normal_keys(
                                 "--http-header-fields=Authorization: Bearer {}",
                                 token_str
                             ))
-                            .arg("--term-status-msg=MPV_RESUME_TIME:${=time-pos}");
+                            .arg("--term-status-msg=MPV_RESUME_TIME:${=time-pos}")
+                            .arg("--fs");
 
                         if let Some(ref t) = resume_time {
                             cmd.arg(format!("--start={}", t));
